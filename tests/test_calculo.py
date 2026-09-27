@@ -11,6 +11,7 @@ from src.calculo import (
     ReglaGES,
     deducible_ges_uf,
     desglose,
+    fecha_cruce,
     regla_vigente,
     uf_a_clp,
 )
@@ -165,6 +166,24 @@ def test_desglose_acumulado_es_corriente():
     assert [f.acumulado for f in filas] == [
         1_000_000, 2_200_000, 3_700_000, 4_500_000, 5_300_000, 5_900_000,
     ]
+
+
+def test_fecha_cruce_es_la_fila_que_alcanza_el_deducible():
+    assert fecha_cruce(desglose(PRESTACIONES, DEDUCIBLE), DEDUCIBLE) == date(2025, 11, 20)
+
+
+def test_fecha_cruce_se_mueve_sin_el_dato_tardio():
+    sin_tardio = [p for p in PRESTACIONES if p.prestacion_id != 7]
+    assert fecha_cruce(desglose(sin_tardio, DEDUCIBLE), DEDUCIBLE) == date(2026, 2, 10)
+
+
+def test_fecha_cruce_none_si_no_se_alcanza():
+    assert fecha_cruce(desglose(PRESTACIONES[:2], DEDUCIBLE), DEDUCIBLE) is None
+
+
+def test_fecha_cruce_exacta_en_el_umbral():
+    filas = desglose([prestacion(1, date(2025, 1, 1), 1_000)], 1_000)
+    assert fecha_cruce(filas, 1_000) == date(2025, 1, 1)
 
 
 # ───────────────────────────────────────────────────────────

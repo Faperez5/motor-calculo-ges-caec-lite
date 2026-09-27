@@ -26,4 +26,4 @@ interactively. In VS Code, open it and pick the `.venv` interpreter as the kerne
 
 ## Status
 
-Phase 1 in progress: pure core (`src/calculo.py`) done. See the build plan for what comes next.
+Phase 1 in progress: pure core (`src/calculo.py`) and database layer (`src/repositorio.py`, `src/persistencia.py`) done. See the build plan for what comes next.

@@ -101,7 +101,7 @@ Defaults for lite. List them in the README.
 | **S01** | `sql/schema.sql`: every table from §4 plus D4, D6, `CHECK (monto_copago >= 0)`, `CHECK (valid_to IS NULL OR valid_from < valid_to)`, `PRAGMA foreign_keys = ON`. | `sqlite3 :memory: < sql/schema.sql` runs. |
 | **S02** | `sql/seed.sql`: `GES01` in two versions (2025: UF 122, closed 2025-12-31; 2026: UF 130, open), one CAEC rule, month-end UF 2025-01 → 2026-12, 2 beneficiaries, ~10 prestaciones including one late arrival. | Loads on top of the schema. |
 | **S03** | `src/calculo.py` + `tests/test_calculo.py` + `runner.ipynb` + `requirements-dev.txt`: dataclasses `ReglaGES`, `ReglaCAEC`, `Prestacion`; `regla_vigente`, `deducible_ges_uf`, `uf_a_clp`, `desglose` (§7.4). Tests: rule boundary (§8.2), gap returns `None`, split invariants, idempotence, and the **`ast` guard** on `calculo.py` imports. | Green. |
-| **S04** | `src/repositorio.py` + `src/persistencia.py`: `conectar`, `inicializar`, `leer_beneficiario`, `leer_prestaciones` (D5), `leer_reglas_ges`; `guardar_resultado` writes header + detail in one transaction (`version_calculo = 1` for now). | Smoke test in a REPL. |
+| **S04** | `src/repositorio.py` + `src/persistencia.py`: `conectar`, `inicializar`, `leer_beneficiario`, `leer_prestaciones` (D5), `leer_reglas_ges`, `leer_uf(fecha)` (raises if missing; GES needs it in S05); `guardar_resultado` writes header + detail in one transaction (`version_calculo = 1` for now). `calculo.py` gains the data it needs: `Beneficiario`, `Resultado`, `fecha_cruce`. DB tests in `test_motor.py` on in-memory SQLite. | Green. |
 | **S05** | `src/motor.py` + `tests/test_motor.py`: CLI `init --db` and `calcular --db --beneficiario --tipo GES [--ahora]`, printing rule id, window, accumulated amount, crossing date. End-to-end test on in-memory SQLite: expected `regla_version_id`, totals, detail sums to header. | Green. **Tag `v0.1-slice`.** |
 
 ### Phase 2 — CAEC
@@ -109,7 +109,7 @@ Defaults for lite. List them in the README.
 | Step | Content | Done when |
 |---|---|---|
 | **S06** | `calculo.py`: `deducible_caec_uf` with `max(piso, min(bruto, techo))` (§7.3), `filtrar_caec` (in network, on/after referral), `fecha_uf_caec`. Tests: 3.5 → 105, 1.0 → 60, 10.0 → 126, multi-event → 181, filter cases, `fecha_uf_caec(2026-03-15) == 2026-02-28`, leap year. | Green. |
-| **S07** | `repositorio.py`: `leer_reglas_caec`, `leer_uf(fecha)` (raises if missing). `motor.py`: `--tipo CAEC`. End-to-end test for beneficiary 2. | Green. **Tag `v0.2-caec`.** |
+| **S07** | `repositorio.py`: `leer_reglas_caec`. `motor.py`: `--tipo CAEC`. End-to-end test for beneficiary 2. | Green. **Tag `v0.2-caec`.** |
 
 ### Phase 3 — Derived window (§5.3)
 

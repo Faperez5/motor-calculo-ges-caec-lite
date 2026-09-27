@@ -52,6 +52,13 @@ class Prestacion:
 
 
 @dataclass(frozen=True)
+class Beneficiario:
+    beneficiario_id: int
+    cotizacion_pactada_uf: float
+    fecha_derivacion_caec: date | None   # None = not referred
+
+
+@dataclass(frozen=True)
 class FilaDesglose:
     prestacion_id: int
     fecha: date
@@ -59,6 +66,20 @@ class FilaDesglose:
     paga_beneficiario: int
     cubre_seguro: int
     acumulado: int
+
+
+@dataclass(frozen=True)
+class Resultado:
+    """One calculation, with everything needed to explain it (spec §1, point 2)."""
+    beneficiario_id: int
+    tipo: str                       # 'GES' | 'CAEC'
+    regla_version_id: int           # lineage
+    ventana_inicio: date
+    ventana_fin: date
+    acumulado: int                  # CLP
+    deducible_aplicado: int         # CLP threshold used for the split
+    fecha_cruce: date | None        # None = deductible not reached
+    filas: tuple[FilaDesglose, ...]
 
 
 # ───────────────────────────────────────────────────────────
@@ -131,3 +152,8 @@ def desglose(prestaciones, deducible_clp: int) -> tuple[FilaDesglose, ...]:
             acumulado=acumulado,
         ))
     return tuple(filas)
+
+
+def fecha_cruce(filas, deducible_clp: int) -> date | None:
+    """Date of the first prestación whose running total reaches the deductible."""
+    return next((f.fecha for f in filas if f.acumulado >= deducible_clp), None)
