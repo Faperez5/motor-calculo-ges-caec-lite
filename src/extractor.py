@@ -113,5 +113,34 @@ def leer_uf(conn, fecha: date) -> float:
     return fila["valor_clp"]
 
 
+def leer_valores_uf(conn) -> dict[date, float]:
+    """The whole UF table, for calculo to pick from (it can't query)."""
+    return {date.fromisoformat(f["fecha"]): f["valor_clp"] for f in conn.execute("SELECT * FROM valores_uf")}
+
+
+# ───────────────────────────────────────────────────────────
+# Results
+# ───────────────────────────────────────────────────────────
+
+def leer_resultado(conn, calculo_id: int) -> dict:
+    """A saved result as stored: header columns plus a `detalle` list. For reports."""
+    cab = conn.execute("SELECT * FROM calculos_resultado WHERE id = ?", (calculo_id,)).fetchone()
+    if cab is None:
+        raise LookupError(f"Result {calculo_id} does not exist")
+    resultado = dict(cab)
+    resultado["detalle"] = [
+        dict(f) for f in conn.execute(
+            """
+            SELECT d.*, p.fecha_prestacion
+            FROM calculos_detalle d JOIN prestaciones p USING (prestacion_id)
+            WHERE d.calculo_id = ?
+            ORDER BY p.fecha_prestacion, d.prestacion_id
+            """,
+            (calculo_id,),
+        )
+    ]
+    return resultado
+
+
 def _fecha(texto: str | None) -> date | None:
     return date.fromisoformat(texto) if texto is not None else None

@@ -96,11 +96,14 @@ CREATE TABLE calculos_resultado (
     deducible_aplicado   INTEGER NOT NULL,     -- CLP
     fecha_cruce          DATE,                 -- NULL = deductible not reached
     calculado_en         TIMESTAMP NOT NULL,
+    conocido_hasta       TIMESTAMP NOT NULL,   -- transaction-time cut the run used (D5)
+    version_codigo       TEXT    NOT NULL,     -- git commit that ran; '-dirty' = uncommitted changes
     motivo_recalculo     TEXT    NOT NULL CHECK (motivo_recalculo IN (
                              'inicial', 'datos_tardios', 'ventana_desplazada',
                              'cambio_normativo', 'correccion')),
     vigente              BOOLEAN NOT NULL CHECK (vigente IN (0, 1)),
     CHECK (ventana_inicio <= ventana_fin),
+    CHECK (conocido_hasta <= calculado_en),    -- a run can't know the future
     UNIQUE (beneficiario_id, tipo, version_calculo)
 );
 

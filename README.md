@@ -19,6 +19,18 @@ pip install -r requirements-dev.txt   # optional: adds ipykernel for runner.ipyn
 python -m pytest -q
 ```
 
+## Run
+
+```bash
+python -m src.motor init     --db data/motor.db
+python -m src.motor calcular --db data/motor.db --beneficiario 1 --tipo GES
+python -m src.motor calcular --help        # --codigo, --ahora, --conocido-hasta
+```
+
+The output is the audit trace of the saved result: rule version, derived window,
+deductible, crossing date, what data the run knew, the git commit that ran, and the
+per-prestación split between beneficiary and insurer.
+
 ## Runner notebook
 
 [`runner.ipynb`](runner.ipynb) runs the test suite and calls the engine's functions
@@ -26,4 +38,4 @@ interactively. In VS Code, open it and pick the `.venv` interpreter as the kerne
 
 ## Status
 
-Phase 1 in progress: pure core (`src/calculo.py`) and database layer (`src/extractor.py`, `src/loader.py`) done. See the build plan for what comes next.
+Phase 1 done (`v0.1-slice`): GES end to end — extract (`src/extractor.py`) → calculate (`src/calculo.py`) → load (`src/loader.py`), run by `src/motor.py`. See the build plan for what comes next.

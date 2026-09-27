@@ -9,7 +9,9 @@ happens in uf_a_clp (plan D4).
 """
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+
+from dateutil.relativedelta import relativedelta
 
 
 # ───────────────────────────────────────────────────────────
@@ -157,3 +159,74 @@ def desglose(prestaciones, deducible_clp: int) -> tuple[FilaDesglose, ...]:
 def fecha_cruce(filas, deducible_clp: int) -> date | None:
     """Date of the first prestación whose running total reaches the deductible."""
     return next((f.fecha for f in filas if f.acumulado >= deducible_clp), None)
+
+
+# ───────────────────────────────────────────────────────────
+# Qualifying prestaciones and the derived window (spec §5.3, §7.5)
+# ───────────────────────────────────────────────────────────
+
+def filtrar_ges(prestaciones, codigo_ges: str) -> list[Prestacion]:
+    """Copagos that count for a GES problem: that code, inside the GES network (§5.1)."""
+    return [p for p in prestaciones if p.codigo_ges == codigo_ges and p.en_red_ges]
+
+
+def derivar_ventana(prestaciones) -> tuple[date, date] | None:
+    """12 months from the first known qualifying copago. Moves if an earlier one shows up."""
+    if not prestaciones:
+        return None
+    inicio = min(p.fecha_prestacion for p in prestaciones)
+    return inicio, inicio + relativedelta(months=12) - timedelta(days=1)
+
+
+def en_ventana(prestaciones, ventana: tuple[date, date]) -> list[Prestacion]:
+    inicio, fin = ventana
+    return [p for p in prestaciones if inicio <= p.fecha_prestacion <= fin]
+
+
+def fecha_uf(ventana_inicio: date) -> date:
+    """UF date for a window: last day of the month before it starts (plan D3)."""
+    return ventana_inicio.replace(day=1) - timedelta(days=1)
+
+
+# ───────────────────────────────────────────────────────────
+# Whole calculation
+# ───────────────────────────────────────────────────────────
+
+def calcular_ges(beneficiario: Beneficiario, prestaciones, reglas, codigo_ges: str,
+                 valores_uf) -> Resultado | None:
+    """filter → window → rule on ventana_inicio (D1) → deductible → split.
+
+    `valores_uf` maps date → CLP. Returns None when there is nothing to
+    calculate (no qualifying copagos). A missing rule or UF value is an error,
+    never a silent skip.
+    """
+    ajenas = {p.beneficiario_id for p in prestaciones} - {beneficiario.beneficiario_id}
+    if ajenas:
+        raise ValueError(f"Prestaciones of other beneficiaries passed in: {sorted(ajenas)}")
+
+    calificadas = filtrar_ges(prestaciones, codigo_ges)
+    ventana = derivar_ventana(calificadas)
+    if ventana is None:
+        return None
+    inicio, fin = ventana
+
+    regla = regla_vigente(codigo_ges, inicio, reglas)
+    if regla is None:
+        raise LookupError(f"No {codigo_ges} rule in force on {inicio}")
+    dia_uf = fecha_uf(inicio)
+    if dia_uf not in valores_uf:
+        raise LookupError(f"No UF value for {dia_uf}")
+
+    deducible = uf_a_clp(deducible_ges_uf(beneficiario.cotizacion_pactada_uf, regla), valores_uf[dia_uf])
+    filas = desglose(en_ventana(calificadas, ventana), deducible)
+    return Resultado(
+        beneficiario_id=beneficiario.beneficiario_id,
+        tipo="GES",
+        regla_version_id=regla.regla_id,
+        ventana_inicio=inicio,
+        ventana_fin=fin,
+        acumulado=filas[-1].acumulado,
+        deducible_aplicado=deducible,
+        fecha_cruce=fecha_cruce(filas, deducible),
+        filas=filas,
+    )

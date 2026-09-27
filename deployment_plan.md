@@ -106,21 +106,21 @@ Defaults for lite. List them in the README.
 | **S02** | `sql/seed.sql`: `GES01` in two versions (2025: UF 122, closed 2025-12-31; 2026: UF 130, open), one CAEC rule, month-end UF 2025-01 → 2026-12, 2 beneficiaries, ~10 prestaciones including one late arrival. | Loads on top of the schema. |
 | **S03** | `src/calculo.py` + `tests/test_calculo.py` + `runner.ipynb` + `requirements-dev.txt`: dataclasses `ReglaGES`, `ReglaCAEC`, `Prestacion`; `regla_vigente`, `deducible_ges_uf`, `uf_a_clp`, `desglose` (§7.4). Tests: rule boundary (§8.2), gap returns `None`, split invariants, idempotence, and the **`ast` guard** on `calculo.py` imports. | Green. |
 | **S04** | `src/extractor.py` + `src/loader.py`: `conectar`, `inicializar`, `leer_beneficiario`, `leer_prestaciones` (D5), `leer_reglas_ges`, `leer_uf(fecha)` (raises if missing; GES needs it in S05); `guardar_resultado` writes header + detail in one transaction (`version_calculo = 1` for now). `calculo.py` gains the data it needs: `Beneficiario`, `Resultado`, `fecha_cruce`. DB tests in `test_motor.py` on in-memory SQLite. | Green. |
-| **S05** | `src/motor.py` + `tests/test_motor.py`: CLI `init --db` and `calcular --db --beneficiario --tipo GES [--ahora]`, printing rule id, window, accumulated amount, crossing date. End-to-end test on in-memory SQLite: expected `regla_version_id`, totals, detail sums to header. | Green. **Tag `v0.1-slice`.** |
+| **S05** | `src/motor.py` + tests: CLI `init --db` and `calcular --db --beneficiario --tipo GES [--codigo] [--ahora] [--conocido-hasta]`. `motor` only wires E → T → L; the GES pipeline is one pure call, `calculo.calcular_ges` (filter → derived window → rule on `ventana_inicio` → deductible → split), with `derivar_ventana`, `en_ventana`, `fecha_uf` (D3). `calculos_resultado` gains `conocido_hasta` (defaults to `--ahora`) and `version_codigo` (git commit, `-dirty` if uncommitted). The trace is printed by `loader.reporte_texto` from the **saved** result. End-to-end tests on in-memory SQLite + CLI tests. | Green. **Tag `v0.1-slice`.** |
 
 ### Phase 2 — CAEC
 
 | Step | Content | Done when |
 |---|---|---|
-| **S06** | `calculo.py`: `deducible_caec_uf` with `max(piso, min(bruto, techo))` (§7.3), `filtrar_caec` (in network, on/after referral), `fecha_uf_caec`. Tests: 3.5 → 105, 1.0 → 60, 10.0 → 126, multi-event → 181, filter cases, `fecha_uf_caec(2026-03-15) == 2026-02-28`, leap year. | Green. |
+| **S06** | `calculo.py`: `deducible_caec_uf` with `max(piso, min(bruto, techo))` (§7.3), `filtrar_caec` (in network, on/after referral), `calcular_caec` (reuses `derivar_ventana` and `fecha_uf`). Tests: 3.5 → 105, 1.0 → 60, 10.0 → 126, multi-event → 181, filter cases. | Green. |
 | **S07** | `extractor.py`: `leer_reglas_caec`. `motor.py`: `--tipo CAEC`. End-to-end test for beneficiary 2. | Green. **Tag `v0.2-caec`.** |
 
 ### Phase 3 — Derived window (§5.3)
 
 | Step | Content | Done when |
 |---|---|---|
-| **S08** | `calculo.py`: `derivar_ventana` (§7.5), `en_ventana`, and one pure `calcular(...) -> Resultado` chaining filter → window → rule on `ventana_inicio` → deductible → split. Tests: window shifts back with an earlier late arrival, drops one prestación and adds another, Feb 29 → Feb 28 end, crossing date moves. | Green. |
-| **S09** | `motor.py`: call `calculo.calcular(...)` instead of the inline pipeline; add `--conocido-hasta`. | Existing tests still green. **Tag `v0.3-ventana`.** |
+| **S08** | `calculo.py`: window-shift tests on top of the `derivar_ventana` built in S05: an earlier late arrival moves the window back, drops one prestación and adds another, and moves the crossing date. **Decide** the Feb 29 case: the spec formula (§7.5) makes a window starting 2024-02-29 end on 2025-02-27; the alternative is 2025-02-28. | Green. |
+| **S09** | `calculo.py`: merge `calcular_ges` / `calcular_caec` into one `calcular(tipo, ...)` if they've grown alike; `motor.py` calls it. Refactor only. | Existing tests still green. **Tag `v0.3-ventana`.** |
 
 ### Phase 4 — Recalculation and versioning (§6)
 
@@ -155,6 +155,8 @@ python -m src.motor init --db data/motor.db
 python -m src.motor calcular --db data/motor.db --beneficiario 1 --tipo GES
 python -m pytest -q
 ```
+
+Each saved result records `version_codigo` (the git commit) and `conocido_hasta`, so it says which code and which data produced it.
 
 To reproduce an old result: `git checkout v0.x-…`, recreate the venv, re-run.
 

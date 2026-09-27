@@ -1,6 +1,7 @@
 """Unit tests for the pure core. No database, no files (except reading calculo.py's source)."""
 
 import ast
+from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
 
@@ -9,9 +10,15 @@ import pytest
 from src.calculo import (
     Prestacion,
     ReglaGES,
+    Beneficiario,
+    calcular_ges,
     deducible_ges_uf,
+    derivar_ventana,
     desglose,
+    en_ventana,
     fecha_cruce,
+    fecha_uf,
+    filtrar_ges,
     regla_vigente,
     uf_a_clp,
 )
@@ -184,6 +191,80 @@ def test_fecha_cruce_none_si_no_se_alcanza():
 def test_fecha_cruce_exacta_en_el_umbral():
     filas = desglose([prestacion(1, date(2025, 1, 1), 1_000)], 1_000)
     assert fecha_cruce(filas, 1_000) == date(2025, 1, 1)
+
+
+# ───────────────────────────────────────────────────────────
+# Filter, window, UF date
+# ───────────────────────────────────────────────────────────
+
+def test_filtrar_ges_excluye_fuera_de_red_y_otros_codigos():
+    base = prestacion(1, date(2025, 3, 10), 1_000)
+    ps = [base, replace(base, prestacion_id=2, en_red_ges=False),
+          replace(base, prestacion_id=3, codigo_ges=None), replace(base, prestacion_id=4, codigo_ges="GES02")]
+    assert [p.prestacion_id for p in filtrar_ges(ps, "GES01")] == [1]
+
+
+def test_derivar_ventana_desde_el_primer_copago():
+    assert derivar_ventana(PRESTACIONES) == (date(2025, 3, 10), date(2026, 3, 9))
+
+
+def test_derivar_ventana_vacia_es_none():
+    assert derivar_ventana([]) is None
+
+
+def test_en_ventana_incluye_ambos_extremos():
+    ps = [prestacion(1, date(2025, 3, 10), 1), prestacion(2, date(2026, 3, 9), 1), prestacion(3, date(2026, 3, 10), 1)]
+    assert [p.prestacion_id for p in en_ventana(ps, (date(2025, 3, 10), date(2026, 3, 9)))] == [1, 2]
+
+
+def test_fecha_uf_es_fin_del_mes_anterior():
+    assert fecha_uf(date(2025, 3, 10)) == date(2025, 2, 28)
+    assert fecha_uf(date(2026, 3, 15)) == date(2026, 2, 28)
+    assert fecha_uf(date(2024, 3, 1)) == date(2024, 2, 29)    # leap year
+    assert fecha_uf(date(2025, 1, 31)) == date(2024, 12, 31)  # year boundary
+
+
+# ───────────────────────────────────────────────────────────
+# calcular_ges
+# ───────────────────────────────────────────────────────────
+
+BEN_1 = Beneficiario(1, 5.0, None)
+UF = {date(2025, 2, 28): 38_630.75}
+
+
+def test_calcular_ges_con_los_datos_del_seed():
+    r = calcular_ges(BEN_1, PRESTACIONES, REGLAS, "GES01", UF)
+    assert (r.regla_version_id, r.deducible_aplicado, r.acumulado, r.fecha_cruce) == (
+        1, DEDUCIBLE, 5_900_000, date(2025, 11, 20))
+    assert (r.ventana_inicio, r.ventana_fin) == (date(2025, 3, 10), date(2026, 3, 9))
+
+
+def test_calcular_ges_usa_la_regla_del_inicio_de_ventana():
+    # prestación 8 (2026-02-10) falls under rule 2's dates, but the window started under rule 1 (D1)
+    assert calcular_ges(BEN_1, PRESTACIONES, REGLAS, "GES01", UF).regla_version_id == 1
+
+
+def test_calcular_ges_sin_calificadas_devuelve_none():
+    assert calcular_ges(BEN_1, [], REGLAS, "GES01", UF) is None
+
+
+def test_calcular_ges_sin_regla_falla():
+    with pytest.raises(LookupError, match="rule"):
+        calcular_ges(BEN_1, PRESTACIONES, [REGLA_2026], "GES01", UF)
+
+
+def test_calcular_ges_sin_uf_falla():
+    with pytest.raises(LookupError, match="UF"):
+        calcular_ges(BEN_1, PRESTACIONES, REGLAS, "GES01", {})
+
+
+def test_calcular_ges_rechaza_prestaciones_de_otro_beneficiario():
+    with pytest.raises(ValueError):
+        calcular_ges(BEN_1, PRESTACIONES + [replace(PRESTACIONES[0], beneficiario_id=2)], REGLAS, "GES01", UF)
+
+
+def test_calcular_ges_es_idempotente():
+    assert calcular_ges(BEN_1, PRESTACIONES, REGLAS, "GES01", UF) == calcular_ges(BEN_1, PRESTACIONES, REGLAS, "GES01", UF)
 
 
 # ───────────────────────────────────────────────────────────
