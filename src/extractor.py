@@ -9,7 +9,7 @@ import sqlite3
 from datetime import date, datetime
 from pathlib import Path
 
-from src.calculo import Beneficiario, Prestacion, ReglaGES
+from src.calculo import Beneficiario, FilaDesglose, Prestacion, ReglaGES, Resultado
 
 SQL_DIR = Path(__file__).resolve().parent.parent / "sql"
 SCHEMA = SQL_DIR / "schema.sql"
@@ -140,6 +140,42 @@ def leer_resultado(conn, calculo_id: int) -> dict:
         )
     ]
     return resultado
+
+
+def leer_resultado_vigente(conn, beneficiario_id: int, tipo: str) -> tuple[int, Resultado] | None:
+    """The current result rebuilt as a Resultado, so calculo can compare it with a new one."""
+    cab = conn.execute(
+        "SELECT id FROM calculos_resultado WHERE beneficiario_id = ? AND tipo = ? AND vigente = 1",
+        (beneficiario_id, tipo),
+    ).fetchone()
+    if cab is None:
+        return None
+    r = leer_resultado(conn, cab["id"])
+    return r["id"], Resultado(
+        beneficiario_id=r["beneficiario_id"],
+        tipo=r["tipo"],
+        regla_version_id=r["regla_version_id"],
+        ventana_inicio=date.fromisoformat(r["ventana_inicio"]),
+        ventana_fin=date.fromisoformat(r["ventana_fin"]),
+        acumulado=r["acumulado"],
+        deducible_aplicado=r["deducible_aplicado"],
+        fecha_cruce=_fecha(r["fecha_cruce"]),
+        filas=tuple(
+            FilaDesglose(
+                prestacion_id=d["prestacion_id"],
+                fecha=date.fromisoformat(d["fecha_prestacion"]),
+                copago=d["copago"],
+                paga_beneficiario=d["paga_beneficiario"],
+                cubre_seguro=d["cubre_seguro"],
+                acumulado=d["acumulado_hasta_aqui"],
+            )
+            for d in r["detalle"]
+        ),
+    )
+
+
+def leer_ids_beneficiarios(conn) -> list[int]:
+    return [f["beneficiario_id"] for f in conn.execute("SELECT beneficiario_id FROM beneficiarios ORDER BY 1")]
 
 
 def _fecha(texto: str | None) -> date | None:

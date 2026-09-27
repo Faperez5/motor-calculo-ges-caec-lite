@@ -129,9 +129,11 @@ def test_guardar_resultado_escribe_cabecera_y_detalle(conn):
 def test_guardar_resultado_es_atomico(conn):
     r = _resultado_ben1(conn)
     loader.guardar_resultado(conn, r, "inicial", AHORA, AHORA, "abc123")
-    with pytest.raises(sqlite3.IntegrityError):  # second current result for the same beneficiary + tipo
-        loader.guardar_resultado(conn, r, "inicial", AHORA, AHORA, "abc123")
-    assert conn.execute("SELECT count(*) FROM calculos_resultado").fetchone()[0] == 1
+    # a detail row pointing at a prestación that doesn't exist fails the FK mid-transaction
+    malo = calculo.Resultado(**{**r.__dict__, "filas": r.filas + (calculo.FilaDesglose(999, date(2025, 12, 1), 1, 1, 0, 1),)})
+    with pytest.raises(sqlite3.IntegrityError):
+        loader.guardar_resultado(conn, malo, "datos_tardios", AHORA, AHORA, "abc123")
+    assert tuple(conn.execute("SELECT count(*), sum(vigente) FROM calculos_resultado").fetchone()) == (1, 1)  # v1 still current
     assert conn.execute("SELECT count(*) FROM calculos_detalle").fetchone()[0] == 6
 
 
@@ -155,7 +157,7 @@ def test_leer_resultado_inexistente_falla(conn):
 # ───────────────────────────────────────────────────────────
 
 def test_calcular_ges_de_punta_a_punta(conn):
-    cid = motor.calcular(conn, 1, "GES", AHORA, version="abc123")
+    cid, _ = motor.calcular(conn, 1, "GES", AHORA, version="abc123")
     r = extractor.leer_resultado(conn, cid)
     assert r["regla_version_id"] == 1                                   # rule in force on ventana_inicio (D1)
     assert (r["ventana_inicio"], r["ventana_fin"]) == ("2025-03-10", "2026-03-09")
@@ -171,7 +173,7 @@ def test_calcular_ges_de_punta_a_punta(conn):
 
 
 def test_calcular_con_conocido_hasta_no_ve_el_dato_tardio(conn):
-    cid = motor.calcular(conn, 1, "GES", AHORA, conocido_hasta=datetime(2026, 3, 4, 23, 59))
+    cid, _ = motor.calcular(conn, 1, "GES", AHORA, conocido_hasta=datetime(2026, 3, 4, 23, 59))
     r = extractor.leer_resultado(conn, cid)
     assert 7 not in [d["prestacion_id"] for d in r["detalle"]]
     assert (r["acumulado"], r["fecha_cruce"]) == (5_100_000, "2026-02-10")
@@ -179,7 +181,7 @@ def test_calcular_con_conocido_hasta_no_ve_el_dato_tardio(conn):
 
 
 def test_ahora_en_el_pasado_limita_lo_conocido(conn):
-    cid = motor.calcular(conn, 1, "GES", datetime(2026, 3, 1))
+    cid, _ = motor.calcular(conn, 1, "GES", datetime(2026, 3, 1))
     assert extractor.leer_resultado(conn, cid)["fecha_cruce"] == "2026-02-10"
 
 
@@ -195,6 +197,95 @@ def test_sin_copagos_calificados_no_escribe_nada(conn):
 
 def test_version_codigo_es_un_commit():
     assert re.fullmatch(r"[0-9a-f]{40}(-dirty)?|unknown", motor.version_codigo())
+
+
+# ───────────────────────────────────────────────────────────
+# Versioning (S11)
+# ───────────────────────────────────────────────────────────
+
+def test_leer_resultado_vigente_reconstruye_lo_guardado(conn):
+    r = _resultado_ben1(conn)
+    cid = loader.guardar_resultado(conn, r, "inicial", AHORA, AHORA, "abc123")
+    assert extractor.leer_resultado_vigente(conn, 1, "GES") == (cid, r)
+
+
+def test_leer_resultado_vigente_sin_resultados(conn):
+    assert extractor.leer_resultado_vigente(conn, 1, "GES") is None
+
+
+def test_guardar_nueva_version_conserva_la_anterior(conn):
+    r = _resultado_ben1(conn)
+    v1 = loader.guardar_resultado(conn, r, "inicial", AHORA, AHORA, "abc123")
+    v2 = loader.guardar_resultado(conn, r, "correccion", AHORA, AHORA, "abc123")
+    filas = conn.execute("SELECT id, version_calculo, vigente, motivo_recalculo FROM calculos_resultado ORDER BY id").fetchall()
+    assert [tuple(f) for f in filas] == [(v1, 1, 0, "inicial"), (v2, 2, 1, "correccion")]
+    assert conn.execute("SELECT count(*) FROM calculos_detalle").fetchone()[0] == 12  # both detail sets kept
+
+
+def test_guardar_sin_cambios_se_rechaza(conn):
+    with pytest.raises(ValueError):
+        loader.guardar_resultado(conn, _resultado_ben1(conn), "sin_cambios", AHORA, AHORA, "abc123")
+
+
+def test_advertencias_se_guardan_y_se_reportan(conn):
+    cid = loader.guardar_resultado(conn, _resultado_ben1(conn), "inicial", AHORA, AHORA, "abc123",
+                                   ["prestación 3: something odd"])
+    r = extractor.leer_resultado(conn, cid)
+    assert r["advertencias"] == "prestación 3: something odd"
+    assert "WARNING         prestación 3: something odd" in loader.reporte_texto(r)
+
+
+def test_calcular_dos_veces_es_idempotente(conn):
+    cid, motivo = motor.calcular(conn, 1, "GES", AHORA)
+    assert motor.calcular(conn, 1, "GES", datetime(2026, 9, 28)) == (cid, "sin_cambios")
+    assert conn.execute("SELECT count(*) FROM calculos_resultado").fetchone()[0] == 1
+
+
+# ───────────────────────────────────────────────────────────
+# cargar_regla_ges (S11, plan D10)
+# ───────────────────────────────────────────────────────────
+
+def _cargar(conn, desde, tope=125.0, codigo="GES01"):
+    return loader.cargar_regla_ges(conn, codigo, desde, 29, tope, "Decreto test", "tester", AHORA)
+
+
+def _versiones(conn, codigo="GES01"):
+    return [(r.regla_id, r.valid_from, r.valid_to, r.tope_uf) for r in extractor.leer_reglas_ges(conn, codigo)]
+
+
+def test_cargar_regla_retroactiva_parte_la_version(conn):
+    rid = _cargar(conn, date(2025, 3, 1))
+    assert _versiones(conn) == [
+        (1, date(2025, 1, 1), date(2025, 2, 28), 122.0),
+        (rid, date(2025, 3, 1), date(2025, 12, 31), 125.0),
+        (2, date(2026, 1, 1), None, 130.0),
+    ]
+    fila = conn.execute("SELECT fuente, cargado_por, cargado_en FROM parametros_ges WHERE regla_id = ?", (rid,)).fetchone()
+    assert tuple(fila) == ("Decreto test", "tester", "2026-09-27T12:00:00")
+
+
+def test_cargar_regla_futura_cierra_la_abierta(conn):
+    rid = _cargar(conn, date(2027, 1, 1), 140.0)
+    assert _versiones(conn)[-2:] == [(2, date(2026, 1, 1), date(2026, 12, 31), 130.0), (rid, date(2027, 1, 1), None, 140.0)]
+
+
+def test_cargar_regla_mismo_dia_no_cambia_nada(conn):
+    antes = _versiones(conn)
+    with pytest.raises(ValueError, match="already starts"):
+        _cargar(conn, date(2026, 1, 1))
+    assert _versiones(conn) == antes
+
+
+def test_cargar_regla_que_deja_el_set_invalido_hace_rollback(conn):
+    # GES02 already has a gap (inserted by hand, bypassing the loader)
+    conn.executescript("""
+        INSERT INTO parametros_ges (codigo_ges, valid_from, valid_to, tope_cotizaciones, tope_uf, cargado_en)
+        VALUES ('GES02', '2025-01-01', '2025-03-31', 29, 100, 'x'), ('GES02', '2025-06-01', NULL, 29, 110, 'x');
+    """)
+    antes = _versiones(conn, "GES02")
+    with pytest.raises(ValueError, match="gap"):
+        _cargar(conn, date(2027, 1, 1), codigo="GES02")
+    assert _versiones(conn, "GES02") == antes
 
 
 # ───────────────────────────────────────────────────────────
@@ -222,13 +313,13 @@ def test_cli_calcular_sin_init_falla(tmp_path, capsys):
     assert "init" in capsys.readouterr().err
 
 
-def test_cli_segundo_calculo_avisa_en_vez_de_romper(tmp_path, capsys):
+def test_cli_segundo_calculo_sin_cambios_no_guarda(tmp_path, capsys):
     db = str(tmp_path / "motor.db")
     motor.main(["init", "--db", db])
     args = ["calcular", "--db", db, "--beneficiario", "1", "--tipo", "GES", "--ahora", "2026-09-27T12:00"]
     motor.main(args)
-    assert motor.main(args) == 1
-    assert "already exists" in capsys.readouterr().err
+    assert motor.main(args) == 0
+    assert "no changes since result #1" in capsys.readouterr().out
 
 
 def test_cli_beneficiario_inexistente(tmp_path, capsys):

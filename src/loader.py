@@ -1,40 +1,48 @@
 """LOAD: every write to the database, and later the Excel/Word reports.
 
-Results are versioned, never overwritten. Facts (prestaciones) are
-append-only. Rules only change through cargar_regla (S11, plan D10).
-
-Phase 1: every result is version 1 and current. Versioning, idempotence and
-motivo detection arrive in S11.
+Results are versioned: a new version marks the previous one vigente = 0 and
+never overwrites it. Facts (prestaciones) are append-only. Rules only change
+through cargar_regla_ges (plan D10).
 """
 
-from datetime import datetime
+from datetime import date, datetime
 
+from src import calculo, extractor
 from src.calculo import Resultado
 
 
 def guardar_resultado(conn, resultado: Resultado, motivo: str, calculado_en: datetime,
-                      conocido_hasta: datetime, version_codigo: str) -> int:
-    """Insert the header and its detail rows in one transaction. Returns the new id.
+                      conocido_hasta: datetime, version_codigo: str, advertencias=()) -> int:
+    """Save `resultado` as the new current version. Returns its id.
 
-    `conocido_hasta` and `version_codigo` are run metadata: what the run knew,
-    and which code produced the number.
-
-    If anything fails (e.g. a current result already exists for this
-    beneficiary and tipo), nothing is written.
+    One transaction: the previous current version (if any) is marked vigente = 0
+    and the new one gets version_calculo = previous + 1. If anything fails,
+    nothing changes, including the previous version's vigente flag.
+    `sin_cambios` is refused: an unchanged result must not create a version.
     """
+    if motivo == "sin_cambios":
+        raise ValueError("sin_cambios: nothing to save")
+    clave = (resultado.beneficiario_id, resultado.tipo)
     with conn:
+        ultima = conn.execute(
+            "SELECT max(version_calculo) FROM calculos_resultado WHERE beneficiario_id = ? AND tipo = ?", clave
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE calculos_resultado SET vigente = 0 WHERE beneficiario_id = ? AND tipo = ? AND vigente = 1", clave
+        )
         cur = conn.execute(
             """
             INSERT INTO calculos_resultado
                 (beneficiario_id, tipo, version_calculo, regla_version_id,
                  ventana_inicio, ventana_fin, acumulado, deducible_aplicado,
                  fecha_cruce, calculado_en, conocido_hasta, version_codigo,
-                 motivo_recalculo, vigente)
-            VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                 advertencias, motivo_recalculo, vigente)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
             """,
             (
                 resultado.beneficiario_id,
                 resultado.tipo,
+                (ultima or 0) + 1,
                 resultado.regla_version_id,
                 resultado.ventana_inicio.isoformat(),
                 resultado.ventana_fin.isoformat(),
@@ -44,6 +52,7 @@ def guardar_resultado(conn, resultado: Resultado, motivo: str, calculado_en: dat
                 calculado_en.isoformat(timespec="seconds"),
                 conocido_hasta.isoformat(timespec="seconds"),
                 version_codigo,
+                "\n".join(advertencias) or None,
                 motivo,
             ),
         )
@@ -60,6 +69,34 @@ def guardar_resultado(conn, resultado: Resultado, motivo: str, calculado_en: dat
             ],
         )
     return calculo_id
+
+
+def cargar_regla_ges(conn, codigo_ges: str, valid_from: date, tope_cotizaciones: int, tope_uf: float,
+                     fuente: str | None, cargado_por: str, cargado_en: datetime) -> int:
+    """Load a new GES rule version (plan D10). Returns its regla_id.
+
+    One transaction: close the version that contains `valid_from`, insert the
+    new one, re-read the whole set and validate it (§8.1). Any problem rolls
+    everything back.
+    """
+    with conn:
+        cierres, valid_to = calculo.planear_nueva_version(
+            extractor.leer_reglas_ges(conn, codigo_ges), codigo_ges, valid_from)
+        for regla_id, hasta in cierres:
+            conn.execute("UPDATE parametros_ges SET valid_to = ? WHERE regla_id = ?", (hasta.isoformat(), regla_id))
+        cur = conn.execute(
+            """
+            INSERT INTO parametros_ges
+                (codigo_ges, valid_from, valid_to, tope_cotizaciones, tope_uf, fuente, cargado_por, cargado_en)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (codigo_ges, valid_from.isoformat(), valid_to.isoformat() if valid_to else None,
+             tope_cotizaciones, tope_uf, fuente, cargado_por, cargado_en.isoformat(timespec="seconds")),
+        )
+        problemas = calculo.validar_reglas(extractor.leer_reglas_ges(conn, codigo_ges))
+        if problemas:
+            raise ValueError("Rule set would be invalid: " + "; ".join(problemas))
+    return cur.lastrowid
 
 
 # ───────────────────────────────────────────────────────────
@@ -80,6 +117,7 @@ def reporte_texto(r: dict) -> str:
         f"  crossed on      {r['fecha_cruce'] or 'not reached'}",
         f"  calculated at   {r['calculado_en']}   (data known up to {r['conocido_hasta']})",
         f"  code version    {r['version_codigo']}",
+        *[f"  WARNING         {a}" for a in (r["advertencias"] or "").splitlines()],
         "",
         f"  {'id':>3}  {'fecha':<10}  {'copago':>11}  {'beneficiary':>11}  {'insurer':>11}  {'accumulated':>11}",
     ]

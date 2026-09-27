@@ -98,6 +98,7 @@ CREATE TABLE calculos_resultado (
     calculado_en         TIMESTAMP NOT NULL,
     conocido_hasta       TIMESTAMP NOT NULL,   -- transaction-time cut the run used (D5)
     version_codigo       TEXT    NOT NULL,     -- git commit that ran; '-dirty' = uncommitted changes
+    advertencias         TEXT,                 -- chequear_datos warnings, one per line; NULL = clean
     motivo_recalculo     TEXT    NOT NULL CHECK (motivo_recalculo IN (
                              'inicial', 'datos_tardios', 'ventana_desplazada',
                              'cambio_normativo', 'correccion')),

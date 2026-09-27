@@ -36,8 +36,11 @@ def version_codigo() -> str:
 
 def calcular(conn, beneficiario_id: int, tipo: str, ahora: datetime,
              conocido_hasta: datetime | None = None, codigo_ges: str = "GES01",
-             version: str = "unknown") -> int | None:
-    """Run one calculation and save it. Returns the result id, or None if there was nothing to calculate.
+             version: str = "unknown") -> tuple[int, str] | None:
+    """Run one calculation and save it if it changed. Returns (result id, motivo).
+
+    With motivo 'sin_cambios' nothing is written and the id is the current
+    result's. None means there was nothing to calculate.
 
     `conocido_hasta` defaults to `ahora`: a run dated in the past only sees
     the data that had arrived by then.
@@ -54,13 +57,21 @@ def calcular(conn, beneficiario_id: int, tipo: str, ahora: datetime,
     reglas = extractor.leer_reglas_ges(conn, codigo_ges)
     valores_uf = extractor.leer_valores_uf(conn)
 
+    vigente = extractor.leer_resultado_vigente(conn, beneficiario_id, tipo)
+    anterior_id, anterior = vigente or (None, None)
+
     # Transform
     resultado = calculo.calcular_ges(beneficiario, prestaciones, reglas, codigo_ges, valores_uf)
     if resultado is None:
         return None
+    motivo = calculo.motivo_recalculo(anterior, resultado)
+    if motivo == "sin_cambios":
+        return anterior_id, motivo
+    avisos = calculo.chequear_datos(prestaciones, reglas)
 
     # Load
-    return loader.guardar_resultado(conn, resultado, "inicial", ahora, conocido_hasta, version)
+    cid = loader.guardar_resultado(conn, resultado, motivo, ahora, conocido_hasta, version, avisos)
+    return cid, motivo
 
 
 # ───────────────────────────────────────────────────────────
@@ -108,19 +119,21 @@ def main(argv=None) -> int:
     conn = extractor.conectar(db)
     try:
         ahora = args.ahora or datetime.now().replace(microsecond=0)
-        cid = calcular(conn, args.beneficiario, args.tipo, ahora, args.conocido_hasta,
-                       args.codigo, version_codigo())
-        if cid is None:
+        salida = calcular(conn, args.beneficiario, args.tipo, ahora, args.conocido_hasta,
+                          args.codigo, version_codigo())
+        if salida is None:
             print(f"beneficiary {args.beneficiario} has no qualifying {args.codigo} copagos: nothing to calculate")
             return 0
+        cid, motivo = salida
+        if motivo == "sin_cambios":
+            print(f"no changes since result #{cid}: nothing saved\n")
         print(loader.reporte_texto(extractor.leer_resultado(conn, cid)))
         return 0
     except (LookupError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
-    except sqlite3.IntegrityError:
-        print("error: a current result already exists for this beneficiary and tipo. "
-              "Recalculation arrives in S11.", file=sys.stderr)
+    except sqlite3.IntegrityError as e:
+        print(f"error: the database refused the write: {e}", file=sys.stderr)
         return 1
     finally:
         conn.close()
