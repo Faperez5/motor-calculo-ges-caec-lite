@@ -9,6 +9,22 @@
 PRAGMA foreign_keys = ON;
 
 -- ───────────────────────────────────────────────────────────
+-- RUNS: one row per CLI command that can write (init, calcular,
+-- recalcular-todos, cargar-regla-ges, ingerir). Read-only commands
+-- aren't logged. A row stuck in 'en_curso' means the process died.
+-- ───────────────────────────────────────────────────────────
+CREATE TABLE ejecuciones (
+    id                INTEGER PRIMARY KEY,
+    comando           TEXT      NOT NULL,      -- the full command line as typed
+    iniciado_en       TIMESTAMP NOT NULL,      -- wall clock, not --ahora
+    terminado_en      TIMESTAMP,
+    usuario           TEXT      NOT NULL,
+    version_codigo    TEXT      NOT NULL,
+    estado            TEXT      NOT NULL CHECK (estado IN ('en_curso', 'ok', 'error')),
+    mensaje           TEXT                     -- outcome summary, or the error
+);
+
+-- ───────────────────────────────────────────────────────────
 -- RULES: SCD2. What the regulation said, and since when.
 -- Overlaps and gaps are checked by calculo.validar_reglas (§8.1);
 -- the indexes below only guarantee one open version.
@@ -23,6 +39,7 @@ CREATE TABLE parametros_ges (
     fuente            TEXT,                    -- which decree
     cargado_por       TEXT,
     cargado_en        TIMESTAMP NOT NULL,
+    ejecucion_id      INTEGER REFERENCES ejecuciones (id),   -- NULL for seed rows
     CHECK (valid_to IS NULL OR valid_from <= valid_to)   -- inclusive: a one-day version is valid
 );
 
@@ -72,7 +89,8 @@ CREATE TABLE prestaciones (
     en_red_ges        BOOLEAN NOT NULL DEFAULT 1 CHECK (en_red_ges IN (0, 1)),   -- plan D6
     en_red_caec       BOOLEAN NOT NULL CHECK (en_red_caec IN (0, 1)),
     monto_arancel     INTEGER NOT NULL CHECK (monto_arancel >= 0),
-    monto_copago      INTEGER NOT NULL CHECK (monto_copago >= 0)
+    monto_copago      INTEGER NOT NULL CHECK (monto_copago >= 0),
+    ejecucion_id      INTEGER REFERENCES ejecuciones (id)    -- the ingestion run; NULL for seed rows
 );
 -- fecha_prestacion != recibido_en IS the late-data signal.
 -- copago <= arancel is a data check (calculo.chequear_datos, §8.3), not a constraint,
@@ -99,6 +117,7 @@ CREATE TABLE calculos_resultado (
     conocido_hasta       TIMESTAMP NOT NULL,   -- transaction-time cut the run used (D5)
     version_codigo       TEXT    NOT NULL,     -- git commit that ran; '-dirty' = uncommitted changes
     advertencias         TEXT,                 -- chequear_datos warnings, one per line; NULL = clean
+    ejecucion_id         INTEGER REFERENCES ejecuciones (id),   -- the command that produced it
     motivo_recalculo     TEXT    NOT NULL CHECK (motivo_recalculo IN (
                              'inicial', 'datos_tardios', 'ventana_desplazada',
                              'cambio_normativo', 'correccion')),

@@ -186,6 +186,11 @@ def leer_historial(conn, beneficiario_id: int, tipo: str) -> list[dict]:
     )]
 
 
+def leer_ejecuciones(conn, limite: int = 20) -> list[dict]:
+    """The last `limite` logged commands, newest first."""
+    return [dict(f) for f in conn.execute("SELECT * FROM ejecuciones ORDER BY id DESC LIMIT ?", (limite,))]
+
+
 def leer_ids_beneficiarios(conn) -> list[int]:
     return [f["beneficiario_id"] for f in conn.execute("SELECT beneficiario_id FROM beneficiarios ORDER BY 1")]
 

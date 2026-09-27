@@ -11,8 +11,28 @@ from src import calculo, extractor
 from src.calculo import Resultado
 
 
+def iniciar_ejecucion(conn, comando: str, usuario: str, version_codigo: str, iniciado_en: datetime) -> int:
+    """Log a command as started, committed at once so a crash still leaves a trace."""
+    with conn:
+        cur = conn.execute(
+            "INSERT INTO ejecuciones (comando, iniciado_en, usuario, version_codigo, estado) "
+            "VALUES (?, ?, ?, ?, 'en_curso')",
+            (comando, iniciado_en.isoformat(timespec="seconds"), usuario, version_codigo),
+        )
+    return cur.lastrowid
+
+
+def terminar_ejecucion(conn, ejecucion_id: int, estado: str, mensaje: str | None, terminado_en: datetime) -> None:
+    with conn:
+        conn.execute(
+            "UPDATE ejecuciones SET estado = ?, mensaje = ?, terminado_en = ? WHERE id = ?",
+            (estado, mensaje, terminado_en.isoformat(timespec="seconds"), ejecucion_id),
+        )
+
+
 def guardar_resultado(conn, resultado: Resultado, motivo: str, calculado_en: datetime,
-                      conocido_hasta: datetime, version_codigo: str, advertencias=()) -> int:
+                      conocido_hasta: datetime, version_codigo: str, advertencias=(),
+                      ejecucion_id: int | None = None) -> int:
     """Save `resultado` as the new current version. Returns its id.
 
     One transaction: the previous current version (if any) is marked vigente = 0
@@ -36,8 +56,8 @@ def guardar_resultado(conn, resultado: Resultado, motivo: str, calculado_en: dat
                 (beneficiario_id, tipo, version_calculo, regla_version_id,
                  ventana_inicio, ventana_fin, acumulado, deducible_aplicado,
                  fecha_cruce, calculado_en, conocido_hasta, version_codigo,
-                 advertencias, motivo_recalculo, vigente)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                 advertencias, ejecucion_id, motivo_recalculo, vigente)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
             """,
             (
                 resultado.beneficiario_id,
@@ -53,6 +73,7 @@ def guardar_resultado(conn, resultado: Resultado, motivo: str, calculado_en: dat
                 conocido_hasta.isoformat(timespec="seconds"),
                 version_codigo,
                 "\n".join(advertencias) or None,
+                ejecucion_id,
                 motivo,
             ),
         )
@@ -72,7 +93,8 @@ def guardar_resultado(conn, resultado: Resultado, motivo: str, calculado_en: dat
 
 
 def cargar_regla_ges(conn, codigo_ges: str, valid_from: date, tope_cotizaciones: int, tope_uf: float,
-                     fuente: str | None, cargado_por: str, cargado_en: datetime) -> int:
+                     fuente: str | None, cargado_por: str, cargado_en: datetime,
+                     ejecucion_id: int | None = None) -> int:
     """Load a new GES rule version (plan D10). Returns its regla_id.
 
     One transaction: close the version that contains `valid_from`, insert the
@@ -87,11 +109,13 @@ def cargar_regla_ges(conn, codigo_ges: str, valid_from: date, tope_cotizaciones:
         cur = conn.execute(
             """
             INSERT INTO parametros_ges
-                (codigo_ges, valid_from, valid_to, tope_cotizaciones, tope_uf, fuente, cargado_por, cargado_en)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (codigo_ges, valid_from, valid_to, tope_cotizaciones, tope_uf, fuente, cargado_por, cargado_en,
+                 ejecucion_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (codigo_ges, valid_from.isoformat(), valid_to.isoformat() if valid_to else None,
-             tope_cotizaciones, tope_uf, fuente, cargado_por, cargado_en.isoformat(timespec="seconds")),
+             tope_cotizaciones, tope_uf, fuente, cargado_por, cargado_en.isoformat(timespec="seconds"),
+             ejecucion_id),
         )
         problemas = calculo.validar_reglas(extractor.leer_reglas_ges(conn, codigo_ges))
         if problemas:
@@ -142,3 +166,17 @@ def reporte_historial(filas: list[dict]) -> str:
             f"{f['fecha_cruce'] or '-':<10}  {f['calculado_en']}"
         )
     return "\n".join(lineas) + "\n  (* = current)"
+
+
+def reporte_ejecuciones(filas: list[dict]) -> str:
+    """One line per logged command, newest first."""
+    if not filas:
+        return "no runs logged"
+    lineas = [f"  {'id':>4}  {'started':<19}  {'user':<10}  {'state':<8}  {'code':<8}  command → outcome"]
+    for f in filas:
+        lineas.append(
+            f"  {f['id']:>4}  {f['iniciado_en']:<19}  {f['usuario'][:10]:<10}  {f['estado']:<8}  "
+            f"{f['version_codigo'][:7] + ('*' if f['version_codigo'].endswith('-dirty') else ''):<8}  "
+            f"{f['comando']}" + (f"  →  {f['mensaje']}" if f["mensaje"] else "")
+        )
+    return "\n".join(lineas) + "\n  (code* = uncommitted changes)"

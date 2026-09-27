@@ -133,6 +133,7 @@ Skipped for now; phases 3–4 don't depend on it. Pick it up by doing S06–S07 
 | **S10** | `calculo.py`: `motivo_recalculo(anterior, nuevo)` (inicial / sin_cambios / ventana_desplazada / cambio_normativo / correccion / datos_tardios), `validar_reglas` (§8.1), `chequear_datos` (§8.3), and `planear_nueva_version` (the pure half of `cargar_regla`: which version to close and where the new one ends, for future and retroactive changes alike). One test per reason and per validation failure. Found and fixed: validity is inclusive, so a one-day version (`valid_from = valid_to`) is valid. | Green. |
 | **S11** | `loader.py`: versioned `guardar_resultado` (previous → `vigente = 0`, new → `prev + 1`, all in one transaction; refuses `sin_cambios`) and `cargar_regla_ges` (applies `planear_nueva_version`, re-validates, rolls back on any problem). `extractor.py`: `leer_resultado_vigente` (rebuilds a `Resultado` so it can be compared), `leer_ids_beneficiarios`. `motor.calcular` now works out `motivo` and writes nothing when unchanged (moved up from S12 so S11 is consistent). New `advertencias` column stores `chequear_datos` warnings; the report shows them. | Green. |
 | **S12** | `motor.py`: `cargar-regla-ges`, `recalcular-todos` and `historial` subcommands. `test_motor.py`: the four scenarios — (1) no change → no new version; (2) late prestación inside window → `datos_tardios` with the **historical** rule; (3) late prestación before window → `ventana_desplazada`, both windows kept; (4) retroactive rule → `cambio_normativo`, old row kept with `vigente = 0`. | Green. **Tag `v0.4-recalculo`.** |
+| **S12b** | Run log. New `ejecuciones` table: one row per command that can write (`init`, `calcular`, `recalcular-todos`, `cargar-regla-ges`, `ingerir`) with the exact command line, user, wall-clock start/end, code version, `ok`/`error` and a one-line outcome. It's committed as `en_curso` first, so a crash still leaves a trace. Results, rules and ingested prestaciones carry `ejecucion_id`. New `ejecuciones` subcommand. Read-only commands aren't logged. | Green. |
 
 ### Phase 5 — Excel ingestion
 
@@ -174,8 +175,8 @@ To reproduce an old result: `git checkout v0.x-…`, recreate the venv, re-run.
 | 1 GES slice | S01–S05 | `v0.1-slice` |
 | 2 CAEC *(deferred)* | S06–S07 | `v0.2-caec` |
 | 3 Window | S08 | `v0.3-ventana` |
-| 4 Recalculation | S10–S12 | `v0.4-recalculo` |
+| 4 Recalculation | S10–S12b | `v0.4-recalculo` |
 | 5 Excel | S13–S14 | `v0.5-ingesta` |
 | 6 CI | S15–S16 | `v1.0-lite` |
 
-17 commits, 14 files, 3 layers, 1 SQLite database, no containers.
+18 commits, 14 files, 3 layers, 1 SQLite database, no containers.

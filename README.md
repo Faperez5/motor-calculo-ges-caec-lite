@@ -33,6 +33,9 @@ python -m src.motor recalcular-todos --db data/motor.db --tipo GES
 
 # every saved version of a result, and why it changed
 python -m src.motor historial --db data/motor.db --beneficiario 1 --tipo GES
+
+# every command that changed the database: who, when, exact command line, code version, outcome
+python -m src.motor ejecuciones --db data/motor.db
 ```
 
 `calcular` prints the audit trace of the saved result: rule version, derived window,

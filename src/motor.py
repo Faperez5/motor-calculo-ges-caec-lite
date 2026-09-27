@@ -8,13 +8,18 @@
     python -m src.motor cargar-regla-ges --db data/motor.db --codigo GES01 --desde 2025-03-01
                                  --tope-uf 125 --fuente "Decreto X"
     python -m src.motor historial --db data/motor.db --beneficiario 1 --tipo GES
+    python -m src.motor ejecuciones --db data/motor.db
 
 Everything that comes from the outside world is decided here and passed in:
 the current time (D8), the as-of cut (D5), the code version.
+
+Every command that can write is logged in `ejecuciones` (who, when, exact
+command line, code version, outcome), and what it writes points back to it.
 """
 
 import argparse
 import getpass
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -41,7 +46,7 @@ def version_codigo() -> str:
 
 def calcular(conn, beneficiario_id: int, tipo: str, ahora: datetime,
              conocido_hasta: datetime | None = None, codigo_ges: str = "GES01",
-             version: str = "unknown") -> tuple[int, str] | None:
+             version: str = "unknown", ejecucion_id: int | None = None) -> tuple[int, str] | None:
     """Run one calculation and save it if it changed. Returns (result id, motivo).
 
     With motivo 'sin_cambios' nothing is written and the id is the current
@@ -75,7 +80,7 @@ def calcular(conn, beneficiario_id: int, tipo: str, ahora: datetime,
     avisos = calculo.chequear_datos(prestaciones, reglas)
 
     # Load
-    cid = loader.guardar_resultado(conn, resultado, motivo, ahora, conocido_hasta, version, avisos)
+    cid = loader.guardar_resultado(conn, resultado, motivo, ahora, conocido_hasta, version, avisos, ejecucion_id)
     return cid, motivo
 
 
@@ -120,84 +125,120 @@ def _args(argv):
     p.add_argument("--db", required=True)
     p.add_argument("--beneficiario", type=int, required=True)
     p.add_argument("--tipo", choices=["GES"], required=True)
+
+    p = sub.add_parser("ejecuciones", help="the log of commands run against this database")
+    p.add_argument("--db", required=True)
+    p.add_argument("--ultimas", type=int, default=20, help="how many to show (default: 20)")
     return ap.parse_args(argv)
 
 
+ESCRIBEN = {"init", "calcular", "recalcular-todos", "cargar-regla-ges", "ingerir"}  # logged in ejecuciones
+
+
 def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else list(argv)
     args = _args(argv)
     db = Path(args.db)
-
-    if args.comando == "init":
-        if db.exists():
-            print(f"error: {db} already exists. Delete it to start over.", file=sys.stderr)
-            return 1
-        conn = extractor.conectar(db)
-        try:
-            extractor.inicializar(conn, seed=None if args.sin_seed else extractor.SEED)
-        finally:
-            conn.close()
-        print(f"created {db}" + ("" if args.sin_seed else " with seed data"))
-        return 0
-
-    if not db.exists():
+    if args.comando == "init" and db.exists():
+        print(f"error: {db} already exists. Delete it to start over.", file=sys.stderr)
+        return 1
+    if args.comando != "init" and not db.exists():
         print(f"error: {db} doesn't exist. Run `init` first.", file=sys.stderr)
         return 1
+
     conn = extractor.conectar(db)
     try:
-        ahora = getattr(args, "ahora", None) or datetime.now().replace(microsecond=0)
-        if args.comando == "calcular":
-            salida = calcular(conn, args.beneficiario, args.tipo, ahora, args.conocido_hasta,
-                              args.codigo, version_codigo())
-            if salida is None:
-                print(f"beneficiary {args.beneficiario} has no qualifying {args.codigo} copagos: nothing to calculate")
-                return 0
-            cid, motivo = salida
-            if motivo == "sin_cambios":
-                print(f"no changes since result #{cid}: nothing saved\n")
-            print(loader.reporte_texto(extractor.leer_resultado(conn, cid)))
-            return 0
-
-        if args.comando == "recalcular-todos":
-            return _recalcular_todos(conn, args, ahora)
-
-        if args.comando == "cargar-regla-ges":
-            rid = loader.cargar_regla_ges(conn, args.codigo, args.desde, args.tope_cotizaciones, args.tope_uf,
-                                          args.fuente, args.cargado_por, ahora)
-            print(f"loaded rule {rid}. {args.codigo} versions now:")
-            for r in extractor.leer_reglas_ges(conn, args.codigo):
-                print(f"  {r.regla_id:>3}  {r.valid_from} → {str(r.valid_to or 'open'):<10}  tope {r.tope_uf} UF")
-            print("run `recalcular-todos` to apply it to saved results")
-            return 0
-
-        if args.comando == "historial":
-            print(loader.reporte_historial(extractor.leer_historial(conn, args.beneficiario, args.tipo)))
-            return 0
-    except (LookupError, ValueError) as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 1
-    except sqlite3.IntegrityError as e:
-        print(f"error: the database refused the write: {e}", file=sys.stderr)
-        return 1
+        if args.comando == "init":
+            extractor.inicializar(conn, seed=None if args.sin_seed else extractor.SEED)
+        version = version_codigo()
+        eid = None
+        if args.comando in ESCRIBEN:
+            eid = loader.iniciar_ejecucion(conn, "python -m src.motor " + shlex.join(argv),
+                                           getpass.getuser(), version, _reloj())
+        try:
+            codigo, mensaje = _ejecutar(conn, args, version, eid)
+        except (LookupError, ValueError, sqlite3.IntegrityError) as e:
+            print(f"error: {e}", file=sys.stderr)
+            codigo, mensaje = 1, str(e)
+        except Exception as e:  # a bug: log it, then let it crash loudly
+            if eid:
+                loader.terminar_ejecucion(conn, eid, "error", f"{type(e).__name__}: {e}", _reloj())
+            raise
+        if eid:
+            loader.terminar_ejecucion(conn, eid, "ok" if codigo == 0 else "error", mensaje, _reloj())
+        return codigo
     finally:
         conn.close()
 
 
-def _recalcular_todos(conn, args, ahora) -> int:
+def _reloj() -> datetime:
+    """Wall-clock time for the run log. Unlike --ahora, never overridden."""
+    return datetime.now().replace(microsecond=0)
+
+
+def _ejecutar(conn, args, version: str, eid: int | None) -> tuple[int, str | None]:
+    """Run one command. Prints for the user; returns (exit code, one-line outcome for the log)."""
+    ahora = getattr(args, "ahora", None) or _reloj()
+
+    if args.comando == "init":
+        semilla = "" if args.sin_seed else " with seed data"
+        print(f"created {args.db}{semilla}")
+        return 0, f"created{semilla}"
+
+    if args.comando == "calcular":
+        salida = calcular(conn, args.beneficiario, args.tipo, ahora, args.conocido_hasta,
+                          args.codigo, version, eid)
+        if salida is None:
+            print(f"beneficiary {args.beneficiario} has no qualifying {args.codigo} copagos: nothing to calculate")
+            return 0, "nothing to calculate"
+        cid, motivo = salida
+        if motivo == "sin_cambios":
+            print(f"no changes since result #{cid}: nothing saved\n")
+        print(loader.reporte_texto(extractor.leer_resultado(conn, cid)))
+        return 0, f"{motivo} → result #{cid}"
+
+    if args.comando == "recalcular-todos":
+        return _recalcular_todos(conn, args, ahora, version, eid)
+
+    if args.comando == "cargar-regla-ges":
+        rid = loader.cargar_regla_ges(conn, args.codigo, args.desde, args.tope_cotizaciones, args.tope_uf,
+                                      args.fuente, args.cargado_por, ahora, eid)
+        print(f"loaded rule {rid}. {args.codigo} versions now:")
+        for r in extractor.leer_reglas_ges(conn, args.codigo):
+            print(f"  {r.regla_id:>3}  {r.valid_from} → {str(r.valid_to or 'open'):<10}  tope {r.tope_uf} UF")
+        print("run `recalcular-todos` to apply it to saved results")
+        return 0, f"loaded rule {rid}"
+
+    if args.comando == "historial":
+        print(loader.reporte_historial(extractor.leer_historial(conn, args.beneficiario, args.tipo)))
+        return 0, None
+
+    if args.comando == "ejecuciones":
+        print(loader.reporte_ejecuciones(extractor.leer_ejecuciones(conn, args.ultimas)))
+        return 0, None
+
+    raise ValueError(f"unknown command {args.comando}")
+
+
+def _recalcular_todos(conn, args, ahora, version, eid) -> tuple[int, str]:
     """Calculate every beneficiary; one line each. Keeps going past errors, exit 1 if any."""
-    version, errores = version_codigo(), 0
+    cuenta: dict[str, int] = {}
     for bid in extractor.leer_ids_beneficiarios(conn):
         try:
-            salida = calcular(conn, bid, args.tipo, ahora, args.conocido_hasta, args.codigo, version)
+            salida = calcular(conn, bid, args.tipo, ahora, args.conocido_hasta, args.codigo, version, eid)
         except (LookupError, ValueError) as e:
-            errores += 1
+            cuenta["error"] = cuenta.get("error", 0) + 1
             print(f"  beneficiary {bid}: ERROR {e}")
             continue
         if salida is None:
+            clave = "nothing to calculate"
             print(f"  beneficiary {bid}: nothing to calculate")
         else:
-            cid, motivo = salida
-            print(f"  beneficiary {bid}: {motivo:<18} result #{cid}")
-    return 1 if errores else 0
+            cid, clave = salida
+            print(f"  beneficiary {bid}: {clave:<18} result #{cid}")
+        cuenta[clave] = cuenta.get(clave, 0) + 1
+    resumen = ", ".join(f"{n} {k}" for k, n in sorted(cuenta.items()))
+    return (1 if "error" in cuenta else 0), resumen
 
 
 if __name__ == "__main__":

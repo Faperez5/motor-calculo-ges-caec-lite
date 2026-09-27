@@ -296,7 +296,7 @@ def _insertar_prestacion(conn, pid, fecha, recibido_en, copago):
     """Stand-in for ingestion (S13): a late GES01 prestación for beneficiary 1."""
     with conn:
         conn.execute(
-            "INSERT INTO prestaciones VALUES (?, 1, ?, ?, 'GES01', 1, 0, ?, ?)",
+            "INSERT INTO prestaciones (prestacion_id, beneficiario_id, fecha_prestacion, recibido_en, codigo_ges, en_red_ges, en_red_caec, monto_arancel, monto_copago) VALUES (?, 1, ?, ?, 'GES01', 1, 0, ?, ?)",
             (pid, fecha, recibido_en, copago * 5, copago),
         )
 
@@ -434,3 +434,97 @@ def test_cli_historial(tmp_path, capsys):
     assert motor.main(["historial", "--db", db, "--beneficiario", "1", "--tipo", "GES"]) == 0
     salida = capsys.readouterr().out
     assert "inicial" in salida and "*  datos_tardios" in salida
+
+
+# ───────────────────────────────────────────────────────────
+# Run log (ejecuciones)
+# ───────────────────────────────────────────────────────────
+
+def _db_con_seed(tmp_path):
+    db = str(tmp_path / "motor.db")
+    motor.main(["init", "--db", db])
+    return db
+
+
+def _runs(db):
+    c = extractor.conectar(db)
+    try:
+        return list(reversed(extractor.leer_ejecuciones(c, 100)))   # oldest first
+    finally:
+        c.close()
+
+
+def _uno(db, sql, *params):
+    c = extractor.conectar(db)
+    try:
+        return c.execute(sql, params).fetchone()[0]
+    finally:
+        c.close()
+
+
+def test_init_queda_registrado(tmp_path):
+    db = _db_con_seed(tmp_path)
+    [run] = _runs(db)
+    assert run["comando"] == f"python -m src.motor init --db {db}"
+    assert (run["estado"], run["mensaje"]) == ("ok", "created with seed data")
+    assert run["terminado_en"] >= run["iniciado_en"]
+
+
+def test_calcular_queda_registrado_y_el_resultado_apunta_a_la_ejecucion(tmp_path):
+    db = _db_con_seed(tmp_path)
+    motor.main(["calcular", "--db", db, "--beneficiario", "1", "--tipo", "GES", "--ahora", "2026-09-27T12:00"])
+    run = _runs(db)[-1]
+    assert "calcular" in run["comando"] and "--beneficiario 1" in run["comando"]
+    assert (run["estado"], run["mensaje"]) == ("ok", "inicial → result #1")
+    assert _uno(db, "SELECT ejecucion_id FROM calculos_resultado WHERE id = 1") == run["id"]
+
+
+def test_sin_cambios_tambien_queda_registrado(tmp_path):
+    db = _db_con_seed(tmp_path)
+    args = ["calcular", "--db", db, "--beneficiario", "1", "--tipo", "GES", "--ahora", "2026-09-27T12:00"]
+    motor.main(args)
+    motor.main(args)
+    assert [r["mensaje"] for r in _runs(db)[1:]] == ["inicial → result #1", "sin_cambios → result #1"]
+
+
+def test_error_queda_registrado(tmp_path):
+    db = _db_con_seed(tmp_path)
+    assert motor.main(["calcular", "--db", db, "--beneficiario", "99", "--tipo", "GES"]) == 1
+    run = _runs(db)[-1]
+    assert run["estado"] == "error" and "99" in run["mensaje"]
+
+
+def test_fallo_inesperado_se_registra_y_se_propaga(tmp_path, monkeypatch):
+    db = _db_con_seed(tmp_path)
+    def explota(*a, **k):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(calculo, "calcular_ges", explota)
+    with pytest.raises(RuntimeError):
+        motor.main(["calcular", "--db", db, "--beneficiario", "1", "--tipo", "GES"])
+    run = _runs(db)[-1]
+    assert (run["estado"], run["mensaje"]) == ("error", "RuntimeError: boom")
+
+
+def test_recalcular_todos_es_una_ejecucion_con_resumen(tmp_path):
+    db = _db_con_seed(tmp_path)
+    motor.main(["recalcular-todos", "--db", db, "--tipo", "GES", "--ahora", "2026-09-27T12:00"])
+    run = _runs(db)[-1]
+    assert run["mensaje"] == "1 inicial, 1 nothing to calculate"
+    assert _uno(db, "SELECT count(*) FROM calculos_resultado WHERE ejecucion_id = ?", run["id"]) == 1
+
+
+def test_cargar_regla_apunta_a_la_ejecucion(tmp_path):
+    db = _db_con_seed(tmp_path)
+    motor.main(["cargar-regla-ges", "--db", db, "--codigo", "GES01", "--desde", "2027-01-01",
+                "--tope-uf", "140", "--fuente", "x"])
+    run = _runs(db)[-1]
+    assert run["mensaje"] == "loaded rule 3"
+    assert _uno(db, "SELECT ejecucion_id FROM parametros_ges WHERE regla_id = 3") == run["id"]
+
+
+def test_comandos_de_lectura_no_se_registran(tmp_path, capsys):
+    db = _db_con_seed(tmp_path)
+    motor.main(["historial", "--db", db, "--beneficiario", "1", "--tipo", "GES"])
+    motor.main(["ejecuciones", "--db", db])
+    assert len(_runs(db)) == 1
+    assert "init --db" in capsys.readouterr().out
