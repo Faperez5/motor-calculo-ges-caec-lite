@@ -34,9 +34,18 @@ python -m src.motor recalcular-todos --db data/motor.db --tipo GES
 # every saved version of a result, and why it changed
 python -m src.motor historial --db data/motor.db --beneficiario 1 --tipo GES
 
+# load prestaciones from an Excel export (format A: clinic, B: insurer), then recalculate
+python -m src.motor ingerir --db data/motor.db --archivo data/export.xlsx --formato A
+python -m src.motor recalcular-todos --db data/motor.db --tipo GES
+
 # every command that changed the database: who, when, exact command line, code version, outcome
 python -m src.motor ejecuciones --db data/motor.db
 ```
+
+`ingerir` never drops a row silently: rows it can't read (bad date, missing amount,
+unknown beneficiary, duplicate of a stored prestación) are listed with their Excel row
+number and reason, and the rest are loaded. The column layouts live in `FORMATOS` in
+`src/motor.py`.
 
 `calcular` prints the audit trace of the saved result: rule version, derived window,
 deductible, crossing date, what data the run knew, the git commit that ran, data
@@ -53,4 +62,4 @@ interactively. In VS Code, open it and pick the `.venv` interpreter as the kerne
 
 ## Status
 
-Phases 1, 3 and 4 done (`v0.4-recalculo`): GES end to end — extract (`src/extractor.py`) → calculate (`src/calculo.py`) → load (`src/loader.py`), run by `src/motor.py` — with a derived window, versioned results and safe rule loading. CAEC (phase 2) is deferred. See the build plan for what comes next.
+Phases 1, 3, 4 and 5 done (`v0.5-ingesta`): GES end to end — extract (`src/extractor.py`) → calculate (`src/calculo.py`) → load (`src/loader.py`), run by `src/motor.py` — with a derived window, versioned results, safe rule loading, Excel ingestion and a run log. CAEC (phase 2) is deferred. See the build plan for what comes next.

@@ -528,3 +528,159 @@ def test_comandos_de_lectura_no_se_registran(tmp_path, capsys):
     motor.main(["ejecuciones", "--db", db])
     assert len(_runs(db)) == 1
     assert "init --db" in capsys.readouterr().out
+
+
+# ───────────────────────────────────────────────────────────
+# Excel ingestion (S13). Files are built inside each test: no binary fixtures.
+# ───────────────────────────────────────────────────────────
+
+import openpyxl  # noqa: E402
+
+ENC_A = ["ID Beneficiario", "Fecha Prestación", "Código GES", "Red GES", "Red CAEC", "Arancel", "Copago"]
+ENC_B = ["beneficiario", "fecha", "problema_ges", "en_red_ges", "en_red_caec", "monto_arancel", "monto_copago"]
+
+
+def _xlsx(path, encabezado, filas):
+    libro = openpyxl.Workbook()
+    hoja = libro.active
+    hoja.append(encabezado)
+    for f in filas:
+        hoja.append(f)
+    libro.save(path)
+    return path
+
+
+@pytest.mark.parametrize("crudo, esperado", [
+    (1234567, 1234567), (500000.0, 500000), ("1.234.567", 1234567), ("$ 1.234.567", 1234567),
+    ("1234567,00", 1234567), ("  800000 ", 800000),
+])
+def test_monto_acepta_formatos_chilenos(crudo, esperado):
+    assert extractor._monto(crudo) == esperado
+
+
+@pytest.mark.parametrize("crudo", ["1,5", "12.34", 12.5, -3, "abc", True])
+def test_monto_rechaza_lo_ambiguo(crudo):
+    with pytest.raises(ValueError):
+        extractor._monto(crudo)
+
+
+@pytest.mark.parametrize("crudo, esperado", [
+    (datetime(2025, 2, 5, 0, 0), date(2025, 2, 5)), ("2025-02-05", date(2025, 2, 5)),
+    ("05-02-2025", date(2025, 2, 5)), ("05/02/2025", date(2025, 2, 5)),
+])
+def test_fecha_excel(crudo, esperado):
+    assert extractor._fecha_excel(crudo) == esperado
+
+
+def test_fecha_excel_rechaza_fecha_imposible():
+    with pytest.raises(ValueError):
+        extractor._fecha_excel("31-02-2025")
+
+
+def test_leer_formato_a_celdas_tipadas(tmp_path):
+    p = _xlsx(tmp_path / "a.xlsx", ENC_A, [[1, datetime(2025, 2, 5), "ges01", "S", "N", 2_500_000, 500_000]])
+    filas, rechazadas = extractor.leer_excel_prestaciones(p, motor.FORMATOS["A"])
+    assert rechazadas == []
+    assert filas == [{"beneficiario_id": 1, "fecha_prestacion": date(2025, 2, 5), "codigo_ges": "GES01",
+                      "en_red_ges": True, "en_red_caec": False, "monto_arancel": 2_500_000,
+                      "monto_copago": 500_000, "fila_excel": 2}]
+
+
+def test_leer_formato_b_todo_texto(tmp_path):
+    p = _xlsx(tmp_path / "b.xlsx", ENC_B, [["1", "05-02-2025", "GES01", "1", "0", "$ 2.500.000", "500.000"]])
+    [fila], _ = extractor.leer_excel_prestaciones(p, motor.FORMATOS["B"])
+    assert (fila["fecha_prestacion"], fila["monto_arancel"], fila["en_red_ges"]) == (date(2025, 2, 5), 2_500_000, True)
+
+
+def test_encabezados_sin_tildes_ni_mayusculas(tmp_path):
+    enc = ["id beneficiario", "  FECHA   PRESTACION ", "codigo ges", "red ges", "red caec", "arancel", "copago"]
+    p = _xlsx(tmp_path / "a.xlsx", enc, [[1, "2025-02-05", None, "S", "N", 100, 20]])
+    filas, _ = extractor.leer_excel_prestaciones(p, motor.FORMATOS["A"])
+    assert len(filas) == 1 and filas[0]["codigo_ges"] is None
+
+
+def test_filas_malas_se_rechazan_con_motivo_y_las_buenas_pasan(tmp_path):
+    p = _xlsx(tmp_path / "a.xlsx", ENC_A, [
+        [1, "2025-02-05", "GES01", "S", "N", 2_500_000, 500_000],      # row 2 ok
+        [1, "31-02-2025", "GES01", "S", "N", 100, 20],                  # row 3 impossible date
+        [1, "2025-02-06", "GES01", "S", "N", 100, None],                # row 4 missing copago
+        [None, None, None, None, None, None, None],                     # row 5 empty: skipped
+        [1, "2025-02-07", "GES01", "quizás", "N", 100, 20],             # row 6 bad flag
+        [1, "2025-02-08", "GES01", "S", "N", 100, -20],                 # row 7 negative
+    ])
+    filas, rechazadas = extractor.leer_excel_prestaciones(p, motor.FORMATOS["A"])
+    assert [f["fila_excel"] for f in filas] == [2]
+    assert [n for n, _ in rechazadas] == [3, 4, 6, 7]
+    assert "fecha_prestacion" in rechazadas[0][1] and "monto_copago: missing" in rechazadas[1][1]
+
+
+def test_columna_obligatoria_faltante_rechaza_el_archivo(tmp_path):
+    p = _xlsx(tmp_path / "a.xlsx", ENC_A[:-1], [[1, "2025-02-05", "GES01", "S", "N", 100]])
+    with pytest.raises(ValueError, match="missing columns.*Copago"):
+        extractor.leer_excel_prestaciones(p, motor.FORMATOS["A"])
+
+
+def test_archivo_que_no_es_xlsx(tmp_path):
+    p = tmp_path / "x.xlsx"
+    p.write_text("not a spreadsheet")
+    with pytest.raises(ValueError, match="not a readable"):
+        extractor.leer_excel_prestaciones(p, motor.FORMATOS["A"])
+
+
+def test_insertar_rechaza_beneficiario_inexistente_y_duplicados(conn):
+    base = {"beneficiario_id": 1, "fecha_prestacion": date(2025, 2, 5), "codigo_ges": "GES01",
+            "en_red_ges": True, "en_red_caec": False, "monto_arancel": 2_500_000, "monto_copago": 500_000}
+    del_seed = {**base, "fecha_prestacion": date(2025, 3, 10), "monto_arancel": 5_000_000, "monto_copago": 1_000_000}
+    filas = [{**base, "fila_excel": 2}, {**base, "fila_excel": 3},            # 3 duplicates 2 (same file)
+             {**base, "beneficiario_id": 99, "fila_excel": 4},
+             {**del_seed, "fila_excel": 5}]                                    # 5 duplicates seed prestación 1
+    nuevas, rechazadas = loader.insertar_prestaciones(conn, filas, AHORA)
+    assert len(nuevas) == 1
+    assert [(f["fila_excel"], m) for f, m in rechazadas] == [
+        (3, f"duplicate of prestación {nuevas[0]}"), (4, "beneficiary 99 does not exist"), (5, "duplicate of prestación 1")]
+    p = extractor.leer_prestaciones(conn, 1)[0]
+    assert (p.prestacion_id, p.recibido_en) == (nuevas[0], AHORA)             # earliest date now
+
+
+def test_ingerir_y_recalcular_da_datos_tardios(tmp_path, capsys):
+    db = _db_con_seed(tmp_path)
+    motor.main(["recalcular-todos", "--db", db, "--tipo", "GES", "--ahora", "2026-09-27T12:00"])
+    p = _xlsx(tmp_path / "tardio.xlsx", ENC_A, [
+        [1, datetime(2025, 12, 1), "GES01", "S", "N", 1_000_000, 200_000],     # inside the window
+        [1, "fecha mala", "GES01", "S", "N", 1, 1],
+    ])
+    capsys.readouterr()
+    assert motor.main(["ingerir", "--db", db, "--archivo", str(p), "--formato", "A", "--ahora", "2026-09-28T09:00"]) == 0
+    salida = capsys.readouterr().out
+    assert "2 rows, 1 loaded, 1 rejected" in salida and "row 3: fecha_prestacion" in salida
+    motor.main(["recalcular-todos", "--db", db, "--tipo", "GES", "--ahora", "2026-09-28T10:00"])
+    assert "beneficiary 1: datos_tardios" in capsys.readouterr().out
+
+    ingesta = next(r for r in _runs(db) if r["comando"].split()[3] == "ingerir")
+    assert ingesta["mensaje"].startswith("tardio.xlsx (sha256 ") and ingesta["mensaje"].endswith("1 loaded, 1 rejected")
+    assert _uno(db, "SELECT count(*) FROM prestaciones WHERE ejecucion_id = ?", ingesta["id"]) == 1
+
+
+def test_ingerir_el_mismo_archivo_dos_veces_no_duplica(tmp_path, capsys):
+    db = _db_con_seed(tmp_path)
+    p = _xlsx(tmp_path / "x.xlsx", ENC_A, [[1, datetime(2025, 12, 1), "GES01", "S", "N", 1_000_000, 200_000]])
+    args = ["ingerir", "--db", db, "--archivo", str(p), "--formato", "A"]
+    motor.main(args)
+    motor.main(args)
+    assert "0 loaded, 1 rejected" in capsys.readouterr().out
+    assert _uno(db, "SELECT count(*) FROM prestaciones") == 15
+
+
+def test_ingerir_con_formato_equivocado_falla_sin_cargar_nada(tmp_path, capsys):
+    db = _db_con_seed(tmp_path)
+    p = _xlsx(tmp_path / "b.xlsx", ENC_B, [["1", "05-02-2025", "GES01", "1", "0", "100", "20"]])
+    assert motor.main(["ingerir", "--db", db, "--archivo", str(p), "--formato", "A"]) == 1
+    assert "wrong --formato" in capsys.readouterr().err
+    assert _uno(db, "SELECT count(*) FROM prestaciones") == 14
+    assert _runs(db)[-1]["estado"] == "error"
+
+
+def test_ingerir_archivo_inexistente(tmp_path, capsys):
+    db = _db_con_seed(tmp_path)
+    assert motor.main(["ingerir", "--db", db, "--archivo", str(tmp_path / "no.xlsx"), "--formato", "A"]) == 1
+    assert "no.xlsx" in capsys.readouterr().err

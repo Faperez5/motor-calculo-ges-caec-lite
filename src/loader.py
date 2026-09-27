@@ -1,7 +1,7 @@
 """LOAD: every write to the database, and later the Excel/Word reports.
 
 Results are versioned: a new version marks the previous one vigente = 0 and
-never overwrites it. Facts (prestaciones) are append-only. Rules only change
+never overwrites it. Facts (prestaciones) are append-only (insertar_prestaciones). Rules only change
 through cargar_regla_ges (plan D10).
 """
 
@@ -90,6 +90,49 @@ def guardar_resultado(conn, resultado: Resultado, motivo: str, calculado_en: dat
             ],
         )
     return calculo_id
+
+
+def insertar_prestaciones(conn, filas: list[dict], recibido_en: datetime,
+                          ejecucion_id: int | None = None) -> tuple[list[int], list[tuple[dict, str]]]:
+    """Append ingested prestaciones (append-only: never updates). Returns (new ids, rejected).
+
+    One transaction. A row is rejected, not inserted, when its beneficiary
+    doesn't exist or when an identical prestación is already stored (same
+    beneficiary, date, code, networks and amounts). That catches a file loaded
+    twice and overlapping exports; it also means two truly identical copagos
+    on the same day need a manual check.
+    """
+    nuevas, rechazadas = [], []
+    with conn:
+        for f in filas:
+            if conn.execute("SELECT 1 FROM beneficiarios WHERE beneficiario_id = ?",
+                            (f["beneficiario_id"],)).fetchone() is None:
+                rechazadas.append((f, f"beneficiary {f['beneficiario_id']} does not exist"))
+                continue
+            clave = (f["beneficiario_id"], f["fecha_prestacion"].isoformat(), f["codigo_ges"],
+                     int(f["en_red_ges"]), int(f["en_red_caec"]), f["monto_arancel"], f["monto_copago"])
+            igual = conn.execute(
+                """
+                SELECT prestacion_id FROM prestaciones
+                WHERE beneficiario_id = ? AND fecha_prestacion = ? AND codigo_ges IS ?
+                  AND en_red_ges = ? AND en_red_caec = ? AND monto_arancel = ? AND monto_copago = ?
+                """,
+                clave,
+            ).fetchone()
+            if igual is not None:
+                rechazadas.append((f, f"duplicate of prestación {igual[0]}"))
+                continue
+            cur = conn.execute(
+                """
+                INSERT INTO prestaciones
+                    (beneficiario_id, fecha_prestacion, codigo_ges, en_red_ges, en_red_caec,
+                     monto_arancel, monto_copago, recibido_en, ejecucion_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (*clave, recibido_en.isoformat(timespec="seconds"), ejecucion_id),
+            )
+            nuevas.append(cur.lastrowid)
+    return nuevas, rechazadas
 
 
 def cargar_regla_ges(conn, codigo_ges: str, valid_from: date, tope_cotizaciones: int, tope_uf: float,

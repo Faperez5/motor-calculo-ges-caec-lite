@@ -5,9 +5,15 @@ loader. The one thing it knows about the rest of the engine is the
 dataclasses in calculo.
 """
 
+import re
 import sqlite3
+import unicodedata
+import zipfile
 from datetime import date, datetime
 from pathlib import Path
+
+import openpyxl
+from openpyxl.utils.exceptions import InvalidFileException
 
 from src.calculo import Beneficiario, FilaDesglose, Prestacion, ReglaGES, Resultado
 
@@ -193,6 +199,152 @@ def leer_ejecuciones(conn, limite: int = 20) -> list[dict]:
 
 def leer_ids_beneficiarios(conn) -> list[int]:
     return [f["beneficiario_id"] for f in conn.execute("SELECT beneficiario_id FROM beneficiarios ORDER BY 1")]
+
+
+# ───────────────────────────────────────────────────────────
+# Excel ingestion (phase 5)
+# ───────────────────────────────────────────────────────────
+
+OBLIGATORIOS = ("beneficiario_id", "fecha_prestacion", "en_red_caec", "monto_arancel", "monto_copago")
+OPCIONALES = {"codigo_ges": None, "en_red_ges": True}     # value used when the column is absent or empty
+
+
+def leer_excel_prestaciones(path, mapeo: dict[str, str]) -> tuple[list[dict], list[tuple[int, str]]]:
+    """Read prestaciones from the first sheet of an .xlsx file.
+
+    `mapeo` maps engine field → column header in this file format. Headers
+    match ignoring case, accents and extra spaces. Returns (rows, rejected):
+    rows are dicts of typed values (plus `fila_excel`, the row number) ready
+    for loader.insertar_prestaciones;
+    rejected is [(excel row number, reason)]. No row is dropped silently.
+    A missing required column refuses the whole file (wrong format).
+    """
+    try:
+        libro = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    except (InvalidFileException, zipfile.BadZipFile, KeyError) as e:
+        raise ValueError(f"{path} is not a readable .xlsx file ({e})") from None
+    try:
+        filas_excel = libro.worksheets[0].iter_rows(values_only=True)
+        encabezado = next(filas_excel, None)
+        if encabezado is None:
+            raise ValueError(f"{path} is empty")
+        columnas = {_normalizar(h): i for i, h in enumerate(encabezado) if h is not None}
+        faltan = [mapeo[c] for c in OBLIGATORIOS if _normalizar(mapeo[c]) not in columnas]
+        if faltan:
+            raise ValueError(f"{path} is missing columns {faltan}: wrong --formato?")
+        indice = {campo: columnas.get(_normalizar(col)) for campo, col in mapeo.items()}
+
+        filas, rechazadas = [], []
+        for n, valores in enumerate(filas_excel, start=2):
+            if all(v is None or str(v).strip() == "" for v in valores):
+                continue
+            try:
+                filas.append({**_leer_fila(valores, indice), "fila_excel": n})
+            except ValueError as e:
+                rechazadas.append((n, str(e)))
+        return filas, rechazadas
+    finally:
+        libro.close()
+
+
+def _leer_fila(valores, indice) -> dict:
+    fila = {}
+    for campo, parser in _PARSERS.items():
+        i = indice.get(campo)
+        crudo = valores[i] if i is not None and i < len(valores) else None
+        if crudo is None or (isinstance(crudo, str) and crudo.strip() == ""):
+            if campo in OPCIONALES:
+                fila[campo] = OPCIONALES[campo]
+                continue
+            raise ValueError(f"{campo}: missing")
+        try:
+            fila[campo] = parser(crudo)
+        except ValueError as e:
+            raise ValueError(f"{campo}: {e}") from None
+    return fila
+
+
+def _normalizar(texto) -> str:
+    """'  Fecha  Prestación ' → 'fecha prestacion'."""
+    sin_tildes = unicodedata.normalize("NFKD", str(texto)).encode("ascii", "ignore").decode()
+    return " ".join(sin_tildes.lower().split())
+
+
+def _entero(v) -> int:
+    if isinstance(v, bool):
+        raise ValueError(f"can't read {v!r} as a number")
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float) and v.is_integer():
+        return int(v)
+    if isinstance(v, str) and v.strip().isdigit():
+        return int(v.strip())
+    raise ValueError(f"can't read {v!r} as a whole number")
+
+
+def _fecha_excel(v) -> date:
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    for formato in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(str(v).strip(), formato).date()
+        except ValueError:
+            pass
+    raise ValueError(f"can't read {v!r} as a date (YYYY-MM-DD, DD-MM-YYYY or DD/MM/YYYY)")
+
+
+def _codigo(v) -> str:
+    return str(v).strip().upper()
+
+
+_SI, _NO = {"s", "si", "y", "yes", "true", "1", "x"}, {"n", "no", "false", "0"}
+
+
+def _booleano(v) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)) and v in (0, 1):
+        return bool(v)
+    texto = _normalizar(v)
+    if texto in _SI:
+        return True
+    if texto in _NO:
+        return False
+    raise ValueError(f"can't read {v!r} as yes/no")
+
+
+def _monto(v) -> int:
+    """CLP amount: 1234567, 1234567.0, '1.234.567', '$ 1.234.567', '1234567,00'. Never negative."""
+    if isinstance(v, bool):
+        raise ValueError(f"can't read {v!r} as an amount")
+    if isinstance(v, (int, float)):
+        if isinstance(v, float) and not v.is_integer():
+            raise ValueError(f"{v!r} has decimals; CLP amounts are whole pesos")
+        monto = int(v)
+    else:
+        texto = str(v).replace("$", "").replace(" ", "").strip()
+        texto = re.sub(r",0+$", "", texto)                      # '1.234.567,00'
+        if re.fullmatch(r"-?\d{1,3}(\.\d{3})+", texto):        # Chilean thousands separator
+            texto = texto.replace(".", "")
+        if not re.fullmatch(r"-?\d+", texto):
+            raise ValueError(f"can't read {v!r} as an amount in pesos")
+        monto = int(texto)
+    if monto < 0:
+        raise ValueError(f"{v!r} is negative")
+    return monto
+
+
+_PARSERS = {
+    "beneficiario_id": _entero,
+    "fecha_prestacion": _fecha_excel,
+    "codigo_ges": _codigo,
+    "en_red_ges": _booleano,
+    "en_red_caec": _booleano,
+    "monto_arancel": _monto,
+    "monto_copago": _monto,
+}
 
 
 def _fecha(texto: str | None) -> date | None:

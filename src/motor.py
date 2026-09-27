@@ -9,6 +9,7 @@
                                  --tope-uf 125 --fuente "Decreto X"
     python -m src.motor historial --db data/motor.db --beneficiario 1 --tipo GES
     python -m src.motor ejecuciones --db data/motor.db
+    python -m src.motor ingerir --db data/motor.db --archivo data/export.xlsx --formato A
 
 Everything that comes from the outside world is decided here and passed in:
 the current time (D8), the as-of cut (D5), the code version.
@@ -19,6 +20,7 @@ command line, code version, outcome), and what it writes points back to it.
 
 import argparse
 import getpass
+import hashlib
 import shlex
 import sqlite3
 import subprocess
@@ -29,6 +31,29 @@ from pathlib import Path
 from src import calculo, extractor, loader
 
 RAIZ = Path(__file__).resolve().parent.parent
+
+# Column headers per source format (engine field → header in the file).
+# Matching ignores case, accents and extra spaces.
+FORMATOS = {
+    "A": {  # clinic export: typed Excel cells, S/N flags
+        "beneficiario_id": "ID Beneficiario",
+        "fecha_prestacion": "Fecha Prestación",
+        "codigo_ges": "Código GES",
+        "en_red_ges": "Red GES",
+        "en_red_caec": "Red CAEC",
+        "monto_arancel": "Arancel",
+        "monto_copago": "Copago",
+    },
+    "B": {  # insurer export: everything as text, DD-MM-YYYY dates, '$ 1.234.567' amounts, 1/0 flags
+        "beneficiario_id": "beneficiario",
+        "fecha_prestacion": "fecha",
+        "codigo_ges": "problema_ges",
+        "en_red_ges": "en_red_ges",
+        "en_red_caec": "en_red_caec",
+        "monto_arancel": "monto_arancel",
+        "monto_copago": "monto_copago",
+    },
+}
 
 
 def version_codigo() -> str:
@@ -126,6 +151,13 @@ def _args(argv):
     p.add_argument("--beneficiario", type=int, required=True)
     p.add_argument("--tipo", choices=["GES"], required=True)
 
+    p = sub.add_parser("ingerir", help="load prestaciones from an Excel export")
+    p.add_argument("--db", required=True)
+    p.add_argument("--archivo", required=True, help=".xlsx file; the first sheet is read")
+    p.add_argument("--formato", choices=sorted(FORMATOS), required=True, help="which column layout the file uses")
+    p.add_argument("--ahora", type=datetime.fromisoformat,
+                   help="reception time stored as recibido_en (default: now)")
+
     p = sub.add_parser("ejecuciones", help="the log of commands run against this database")
     p.add_argument("--db", required=True)
     p.add_argument("--ultimas", type=int, default=20, help="how many to show (default: 20)")
@@ -157,7 +189,7 @@ def main(argv=None) -> int:
                                            getpass.getuser(), version, _reloj())
         try:
             codigo, mensaje = _ejecutar(conn, args, version, eid)
-        except (LookupError, ValueError, sqlite3.IntegrityError) as e:
+        except (LookupError, ValueError, OSError, sqlite3.IntegrityError) as e:
             print(f"error: {e}", file=sys.stderr)
             codigo, mensaje = 1, str(e)
         except Exception as e:  # a bug: log it, then let it crash loudly
@@ -209,6 +241,9 @@ def _ejecutar(conn, args, version: str, eid: int | None) -> tuple[int, str | Non
         print("run `recalcular-todos` to apply it to saved results")
         return 0, f"loaded rule {rid}"
 
+    if args.comando == "ingerir":
+        return _ingerir(conn, args, ahora, eid)
+
     if args.comando == "historial":
         print(loader.reporte_historial(extractor.leer_historial(conn, args.beneficiario, args.tipo)))
         return 0, None
@@ -218,6 +253,22 @@ def _ejecutar(conn, args, version: str, eid: int | None) -> tuple[int, str | Non
         return 0, None
 
     raise ValueError(f"unknown command {args.comando}")
+
+
+def _ingerir(conn, args, ahora, eid) -> tuple[int, str]:
+    """Excel → prestaciones. Rejected rows are listed, never dropped silently."""
+    archivo = Path(args.archivo)
+    huella = hashlib.sha256(archivo.read_bytes()).hexdigest()[:12]
+    filas, rechazadas = extractor.leer_excel_prestaciones(archivo, FORMATOS[args.formato])
+    nuevas, duplicadas = loader.insertar_prestaciones(conn, filas, ahora, eid)
+    rechazadas += [(f["fila_excel"], motivo) for f, motivo in duplicadas]
+
+    print(f"{archivo.name}: {len(nuevas) + len(rechazadas)} rows, {len(nuevas)} loaded, {len(rechazadas)} rejected")
+    for n, motivo in sorted(rechazadas):
+        print(f"  row {n}: {motivo}")
+    if nuevas:
+        print("run `recalcular-todos` to apply them")
+    return 0, f"{archivo.name} (sha256 {huella}): {len(nuevas)} loaded, {len(rechazadas)} rejected"
 
 
 def _recalcular_todos(conn, args, ahora, version, eid) -> tuple[int, str]:

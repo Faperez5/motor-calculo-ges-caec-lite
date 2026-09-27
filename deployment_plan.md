@@ -88,6 +88,7 @@ Defaults for lite. List them in the README.
 | D9 | Period close (§6) | Not implemented. Every recalculation creates a new version. |
 | D10 | How rules get into the database | Only through `loader.cargar_regla` (S11), which closes the previous version, fills `cargado_por`/`cargado_en`, runs `validar_reglas`, and rolls back on failure. No manual `INSERT`/`UPDATE` on rule tables (§3.3), and no Excel "master" that gets edited in place. Excel is fine as an **input format** (one file or row per change) fed through the same loader (S14). |
 | D11 | Window ending when it starts on Feb 29 | The window ends the day before the anniversary; a Feb 29 start's anniversary is Mar 1, so 2024-02-29 → 2025-02-28 (the spec formula in §7.5 would give 2025-02-27). |
+| D12 | Re-ingesting the same rows | An ingested row identical to a stored prestación (same beneficiary, date, code, networks and amounts) is rejected as a duplicate, never inserted twice. Catches a file loaded twice and overlapping exports; two genuinely identical copagos on one day need a manual check. |
 
 ---
 
@@ -139,8 +140,8 @@ Skipped for now; phases 3–4 don't depend on it. Pick it up by doing S06–S07 
 
 | Step | Content | Done when |
 |---|---|---|
-| **S13** | Add `openpyxl` to `requirements.txt` (re-freeze). `extractor.py`: `leer_excel_prestaciones(path, mapeo)` returning rows + `rechazadas`. `loader.py`: append-only `insertar_prestaciones`. `motor.py`: `ingerir --archivo --formato A\|B`. Test builds a tiny `.xlsx` in `tmp_path`, ingests, checks rejects, recalculates → `datos_tardios`. | Green. |
-| **S14** | *(optional, when someone non-technical maintains rules)* `extractor.py`: `leer_excel_reglas(path)`. `motor.py`: `cargar-reglas --archivo x.xlsx --cargado-por <nombre>`, which sends each row through `cargar_regla` (D10). The whole file loads in one transaction or not at all. Test: a valid file loads and closes the previous version; a file that creates an overlap loads nothing. | Green. **Tag `v0.5-ingesta`.** |
+| **S13** | Add `openpyxl` to `requirements.txt`. `extractor.py`: `leer_excel_prestaciones(path, mapeo)` → typed rows + `rechazadas` (row number, reason); headers match ignoring case/accents/spaces; parses Excel dates and `DD-MM-YYYY`, `$ 1.234.567` amounts, S/N and 1/0 flags; a missing required column refuses the whole file. `loader.py`: append-only `insertar_prestaciones` (rejects unknown beneficiaries and duplicates, D12; stores `ejecucion_id`). `motor.py`: `ingerir --archivo --formato A\|B [--ahora]`, formats as column mappings in `FORMATOS`; the run log records the file's SHA-256. Tests build `.xlsx` files in `tmp_path`; ingest → recalculate → `datos_tardios`. | Green. **Tag `v0.5-ingesta`.** |
+| **S14** | *(optional, when someone non-technical maintains rules)* `extractor.py`: `leer_excel_reglas(path)`. `motor.py`: `cargar-reglas --archivo x.xlsx --cargado-por <nombre>`, which sends each row through `cargar_regla` (D10). The whole file loads in one transaction or not at all. Test: a valid file loads and closes the previous version; a file that creates an overlap loads nothing. | *Not done (optional).* |
 
 ### Phase 6 — CI and wrap-up
 
