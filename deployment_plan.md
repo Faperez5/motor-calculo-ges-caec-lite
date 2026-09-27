@@ -11,7 +11,8 @@
 | Rule | What it means in practice |
 |---|---|
 | **Small commits** | Each step is one commit: the code change plus its tests. Commit message: `S<nn>: <what>`. |
-| **Few files** | 12 files total (§1). Helpers go in an existing module. |
+| **Few files** | 14 files total (§1). Helpers go in an existing module. |
+| **Notebook is a front end** | `runner.ipynb` only calls code in `src/`; it holds no logic of its own. Clear its outputs before committing. Each step that adds something runnable adds a cell. |
 | **Pure core** | `calculo.py` has no `sqlite3`, no `open()`, no `datetime.now()`, and doesn't import `repositorio` or `persistencia`. A test enforces this. |
 | **Suite stays green** | `python -m pytest -q` before every push. |
 
@@ -37,7 +38,9 @@ A container adds a file, a build step, and a tool to install, and it doesn't buy
 ```
 motor-ges-caec-lite/
 ├── README.md
-├── requirements.txt            # pinned (pip freeze)
+├── requirements.txt            # pinned (pip freeze): what the engine needs
+├── requirements-dev.txt        # + ipykernel, to run the notebook
+├── runner.ipynb                # interactive runner: tests + calls into src/
 ├── .gitignore
 ├── .github/workflows/ci.yml    # phase 6
 ├── sql/
@@ -72,7 +75,7 @@ Defaults for lite. List them in the README.
 |---|---|---|
 | D1 | Rule for a window that crosses a rule change | The rule in force on `ventana_inicio` applies to the whole window (one `regla_version_id` per result). |
 | D2 | Window starts at the chronologically first copago, or the first one known? (§5.3) | Chronological. The "as known at" view comes from `conocido_hasta` (D5). |
-| D3 | UF value for the CAEC deductible | UF on the last day of the month before `ventana_inicio`. One conversion per window. |
+| D3 | UF value for converting a deductible to CLP | UF on the last day of the month before `ventana_inicio`, for both GES and CAEC. One conversion per window. |
 | D4 | Money type | CLP as `INTEGER`, UF as `REAL`. Round once, when converting UF → CLP, in `calculo.py`. |
 | D5 | Transaction-time queries | `leer_prestaciones(beneficiario_id, conocido_hasta)` filters on `recibido_en <= conocido_hasta`. |
 | D6 | GES network flag | Add `en_red_ges BOOLEAN NOT NULL DEFAULT 1` to `prestaciones`. |
@@ -97,7 +100,7 @@ Defaults for lite. List them in the README.
 |---|---|---|
 | **S01** | `sql/schema.sql`: every table from §4 plus D4, D6, `CHECK (monto_copago >= 0)`, `CHECK (valid_to IS NULL OR valid_from < valid_to)`, `PRAGMA foreign_keys = ON`. | `sqlite3 :memory: < sql/schema.sql` runs. |
 | **S02** | `sql/seed.sql`: `GES01` in two versions (2025: UF 122, closed 2025-12-31; 2026: UF 130, open), one CAEC rule, month-end UF 2025-01 → 2026-12, 2 beneficiaries, ~10 prestaciones including one late arrival. | Loads on top of the schema. |
-| **S03** | `src/calculo.py` + `tests/test_calculo.py`: dataclasses `ReglaGES`, `ReglaCAEC`, `Prestacion`; `regla_vigente`, `deducible_ges_uf`, `uf_a_clp`, `desglose` (§7.4). Tests: rule boundary (§8.2), gap returns `None`, split invariants, idempotence, and the **`ast` guard** on `calculo.py` imports. | Green. |
+| **S03** | `src/calculo.py` + `tests/test_calculo.py` + `runner.ipynb` + `requirements-dev.txt`: dataclasses `ReglaGES`, `ReglaCAEC`, `Prestacion`; `regla_vigente`, `deducible_ges_uf`, `uf_a_clp`, `desglose` (§7.4). Tests: rule boundary (§8.2), gap returns `None`, split invariants, idempotence, and the **`ast` guard** on `calculo.py` imports. | Green. |
 | **S04** | `src/repositorio.py` + `src/persistencia.py`: `conectar`, `inicializar`, `leer_beneficiario`, `leer_prestaciones` (D5), `leer_reglas_ges`; `guardar_resultado` writes header + detail in one transaction (`version_calculo = 1` for now). | Smoke test in a REPL. |
 | **S05** | `src/motor.py` + `tests/test_motor.py`: CLI `init --db` and `calcular --db --beneficiario --tipo GES [--ahora]`, printing rule id, window, accumulated amount, crossing date. End-to-end test on in-memory SQLite: expected `regla_version_id`, totals, detail sums to header. | Green. **Tag `v0.1-slice`.** |
 
@@ -143,7 +146,7 @@ Defaults for lite. List them in the README.
 
 ```bash
 python3.12 -m venv .venv && . .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.txt       # or requirements-dev.txt, to use runner.ipynb
 python -m src.motor init --db data/motor.db
 python -m src.motor calcular --db data/motor.db --beneficiario 1 --tipo GES
 python -m pytest -q
@@ -165,4 +168,4 @@ To reproduce an old result: `git checkout v0.x-…`, recreate the venv, re-run.
 | 5 Excel | S13–S14 | `v0.5-ingesta` |
 | 6 CI | S15–S16 | `v1.0-lite` |
 
-17 commits, 12 files, 3 layers, 1 SQLite database, no containers.
+17 commits, 14 files, 3 layers, 1 SQLite database, no containers.

@@ -14,10 +14,16 @@ Requires Python 3.12.
 ```bash
 python3.12 -m venv .venv        # or: uv venv --python 3.12 --seed .venv
 . .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.txt       # engine + tests
+pip install -r requirements-dev.txt   # optional: adds ipykernel for runner.ipynb
 python -m pytest -q
 ```
 
+## Runner notebook
+
+[`runner.ipynb`](runner.ipynb) runs the test suite and calls the engine's functions
+interactively. In VS Code, open it and pick the `.venv` interpreter as the kernel.
+
 ## Status
 
-Phase 0 (bootstrap). See the build plan for what comes next.
+Phase 1 in progress: pure core (`src/calculo.py`) done. See the build plan for what comes next.
