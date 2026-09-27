@@ -127,3 +127,18 @@ def reporte_texto(r: dict) -> str:
             f"{d['paga_beneficiario']:>11,}  {d['cubre_seguro']:>11,}  {d['acumulado_hasta_aqui']:>11,}"
         )
     return "\n".join(lineas)
+
+
+def reporte_historial(filas: list[dict]) -> str:
+    """One line per saved version, to see how and why a result changed."""
+    if not filas:
+        return "no saved results"
+    lineas = [f"  {'ver':>3}  {'':1}  {'motivo':<18}  {'rule':>4}  {'window':<23}  {'deductible':>11}  "
+              f"{'crossed on':<10}  calculated at"]
+    for f in filas:
+        lineas.append(
+            f"  {f['version_calculo']:>3}  {'*' if f['vigente'] else ' '}  {f['motivo_recalculo']:<18}  "
+            f"{f['regla_version_id']:>4}  {f['ventana_inicio']} → {f['ventana_fin']}  {f['deducible_aplicado']:>11,}  "
+            f"{f['fecha_cruce'] or '-':<10}  {f['calculado_en']}"
+        )
+    return "\n".join(lineas) + "\n  (* = current)"

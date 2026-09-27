@@ -289,6 +289,81 @@ def test_cargar_regla_que_deja_el_set_invalido_hace_rollback(conn):
 
 
 # ───────────────────────────────────────────────────────────
+# The four recalculation scenarios (spec §6) — why this project exists
+# ───────────────────────────────────────────────────────────
+
+def _insertar_prestacion(conn, pid, fecha, recibido_en, copago):
+    """Stand-in for ingestion (S13): a late GES01 prestación for beneficiary 1."""
+    with conn:
+        conn.execute(
+            "INSERT INTO prestaciones VALUES (?, 1, ?, ?, 'GES01', 1, 0, ?, ?)",
+            (pid, fecha, recibido_en, copago * 5, copago),
+        )
+
+
+def _historial(conn):
+    return [(f["version_calculo"], f["vigente"], f["motivo_recalculo"], f["regla_version_id"], f["ventana_inicio"])
+            for f in extractor.leer_historial(conn, 1, "GES")]
+
+
+def test_escenario_1_sin_cambios_no_crea_version(conn):
+    motor.calcular(conn, 1, "GES", AHORA)
+    _, motivo = motor.calcular(conn, 1, "GES", datetime(2026, 10, 1))
+    assert motivo == "sin_cambios"
+    assert _historial(conn) == [(1, 1, "inicial", 1, "2025-03-10")]
+
+
+def test_escenario_2_dato_tardio_usa_la_regla_historica(conn):
+    # First run on 2026-03-04: prestación 7 (received 2026-03-05) isn't known yet.
+    motor.calcular(conn, 1, "GES", datetime(2026, 3, 4, 23, 59))
+    cid, motivo = motor.calcular(conn, 1, "GES", AHORA)
+    assert motivo == "datos_tardios"
+    r = extractor.leer_resultado(conn, cid)
+    # Today's rule is version 2 (130 UF); the period's rule is version 1 (122 UF). The period's wins.
+    assert calculo.regla_vigente("GES01", AHORA.date(), extractor.leer_reglas_ges(conn, "GES01")).regla_id == 2
+    assert (r["regla_version_id"], r["deducible_aplicado"]) == (1, 4_712_952)
+    assert r["fecha_cruce"] == "2025-11-20"                       # was 2026-02-10 before prestación 7 arrived
+    assert _historial(conn) == [(1, 0, "inicial", 1, "2025-03-10"), (2, 1, "datos_tardios", 1, "2025-03-10")]
+
+
+def test_escenario_3_dato_anterior_desplaza_la_ventana(conn):
+    motor.calcular(conn, 1, "GES", AHORA)
+    _insertar_prestacion(conn, 20, "2025-02-05", "2026-09-28T09:00:00", 500_000)
+    cid, motivo = motor.calcular(conn, 1, "GES", datetime(2026, 9, 28, 12, 0))
+    assert motivo == "ventana_desplazada"
+    r = extractor.leer_resultado(conn, cid)
+    assert (r["ventana_inicio"], r["ventana_fin"]) == ("2025-02-05", "2026-02-04")
+    ids = [d["prestacion_id"] for d in r["detalle"]]
+    assert ids[0] == 20 and 8 not in ids                          # 8 (2026-02-10) fell off the new end
+    # both windows stay in history
+    assert _historial(conn) == [(1, 0, "inicial", 1, "2025-03-10"), (2, 1, "ventana_desplazada", 1, "2025-02-05")]
+
+
+def test_escenario_4_cambio_normativo_retroactivo(conn):
+    motor.calcular(conn, 1, "GES", AHORA)
+    rid = loader.cargar_regla_ges(conn, "GES01", date(2025, 3, 1), 29, 125.0, "Decreto test", "tester", AHORA)
+    cid, motivo = motor.calcular(conn, 1, "GES", datetime(2026, 9, 28))
+    assert motivo == "cambio_normativo"
+    r = extractor.leer_resultado(conn, cid)
+    assert (r["regla_version_id"], r["deducible_aplicado"]) == (rid, 4_828_844)   # 125 × 38 630.75
+    assert _historial(conn) == [(1, 0, "inicial", 1, "2025-03-10"), (2, 1, "cambio_normativo", rid, "2025-03-10")]
+
+
+def test_historial_completo_de_los_cuatro_escenarios_juntos(conn):
+    motor.calcular(conn, 1, "GES", datetime(2026, 3, 4, 23, 59))                       # inicial
+    motor.calcular(conn, 1, "GES", datetime(2026, 3, 6))                               # datos_tardios
+    motor.calcular(conn, 1, "GES", datetime(2026, 3, 7))                               # sin_cambios
+    loader.cargar_regla_ges(conn, "GES01", date(2025, 3, 1), 29, 125.0, "D", "t", datetime(2026, 4, 1))
+    motor.calcular(conn, 1, "GES", datetime(2026, 4, 2))                               # cambio_normativo
+    _insertar_prestacion(conn, 20, "2025-02-05", "2026-05-01T09:00:00", 500_000)
+    motor.calcular(conn, 1, "GES", datetime(2026, 5, 2))                               # ventana_desplazada
+    assert [(v, m) for v, _, m, _, _ in _historial(conn)] == [
+        (1, "inicial"), (2, "datos_tardios"), (3, "cambio_normativo"), (4, "ventana_desplazada")]
+    # the window moved back to 2025-02-05, which falls under rule 1 again
+    assert _historial(conn)[-1][3] == 1
+
+
+# ───────────────────────────────────────────────────────────
 # CLI
 # ───────────────────────────────────────────────────────────
 
@@ -327,3 +402,35 @@ def test_cli_beneficiario_inexistente(tmp_path, capsys):
     motor.main(["init", "--db", db])
     assert motor.main(["calcular", "--db", db, "--beneficiario", "99", "--tipo", "GES"]) == 1
     assert "99" in capsys.readouterr().err
+
+
+def test_cli_cargar_regla_y_recalcular_todos(tmp_path, capsys):
+    db = str(tmp_path / "motor.db")
+    motor.main(["init", "--db", db])
+    motor.main(["recalcular-todos", "--db", db, "--tipo", "GES", "--ahora", "2026-09-27T12:00"])
+    assert motor.main(["cargar-regla-ges", "--db", db, "--codigo", "GES01", "--desde", "2025-03-01",
+                       "--tope-uf", "125", "--fuente", "Decreto test", "--ahora", "2026-09-27T13:00"]) == 0
+    assert motor.main(["recalcular-todos", "--db", db, "--tipo", "GES", "--ahora", "2026-09-27T14:00"]) == 0
+    salida = capsys.readouterr().out
+    assert "loaded rule 3" in salida
+    assert "2025-03-01 → 2025-12-31  tope 125.0 UF" in salida and "<10" not in salida
+    assert "beneficiary 1: cambio_normativo" in salida and "beneficiary 2: nothing to calculate" in salida
+
+
+def test_cli_cargar_regla_invalida_falla(tmp_path, capsys):
+    db = str(tmp_path / "motor.db")
+    motor.main(["init", "--db", db])
+    assert motor.main(["cargar-regla-ges", "--db", db, "--codigo", "GES01", "--desde", "2026-01-01",
+                       "--tope-uf", "125", "--fuente", "x"]) == 1
+    assert "already starts" in capsys.readouterr().err
+
+
+def test_cli_historial(tmp_path, capsys):
+    db = str(tmp_path / "motor.db")
+    motor.main(["init", "--db", db])
+    motor.main(["calcular", "--db", db, "--beneficiario", "1", "--tipo", "GES", "--ahora", "2026-03-04T23:59"])
+    motor.main(["calcular", "--db", db, "--beneficiario", "1", "--tipo", "GES", "--ahora", "2026-09-27T12:00"])
+    capsys.readouterr()
+    assert motor.main(["historial", "--db", db, "--beneficiario", "1", "--tipo", "GES"]) == 0
+    salida = capsys.readouterr().out
+    assert "inicial" in salida and "*  datos_tardios" in salida

@@ -25,11 +25,23 @@ python -m pytest -q
 python -m src.motor init     --db data/motor.db
 python -m src.motor calcular --db data/motor.db --beneficiario 1 --tipo GES
 python -m src.motor calcular --help        # --codigo, --ahora, --conocido-hasta
+
+# load a rule change (future or retroactive), then apply it everywhere
+python -m src.motor cargar-regla-ges --db data/motor.db --codigo GES01 --desde 2025-03-01 \
+                                     --tope-uf 125 --fuente "Decreto X"
+python -m src.motor recalcular-todos --db data/motor.db --tipo GES
+
+# every saved version of a result, and why it changed
+python -m src.motor historial --db data/motor.db --beneficiario 1 --tipo GES
 ```
 
-The output is the audit trace of the saved result: rule version, derived window,
-deductible, crossing date, what data the run knew, the git commit that ran, and the
-per-prestación split between beneficiary and insurer.
+`calcular` prints the audit trace of the saved result: rule version, derived window,
+deductible, crossing date, what data the run knew, the git commit that ran, data
+warnings, and the per-prestación split between beneficiary and insurer.
+
+Results are never overwritten. A recalculation saves a new version with its reason
+(`datos_tardios`, `ventana_desplazada`, `cambio_normativo`, `correccion`) and marks the
+old one as superseded; if nothing changed, nothing is saved.
 
 ## Runner notebook
 
@@ -38,4 +50,4 @@ interactively. In VS Code, open it and pick the `.venv` interpreter as the kerne
 
 ## Status
 
-Phase 1 done (`v0.1-slice`): GES end to end — extract (`src/extractor.py`) → calculate (`src/calculo.py`) → load (`src/loader.py`), run by `src/motor.py`. See the build plan for what comes next.
+Phases 1, 3 and 4 done (`v0.4-recalculo`): GES end to end — extract (`src/extractor.py`) → calculate (`src/calculo.py`) → load (`src/loader.py`), run by `src/motor.py` — with a derived window, versioned results and safe rule loading. CAEC (phase 2) is deferred. See the build plan for what comes next.

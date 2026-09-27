@@ -4,16 +4,21 @@
     python -m src.motor calcular --db data/motor.db --beneficiario 1 --tipo GES
                                  [--codigo GES01] [--ahora 2026-09-27T12:00]
                                  [--conocido-hasta 2026-03-04T23:59]
+    python -m src.motor recalcular-todos --db data/motor.db --tipo GES
+    python -m src.motor cargar-regla-ges --db data/motor.db --codigo GES01 --desde 2025-03-01
+                                 --tope-uf 125 --fuente "Decreto X"
+    python -m src.motor historial --db data/motor.db --beneficiario 1 --tipo GES
 
 Everything that comes from the outside world is decided here and passed in:
 the current time (D8), the as-of cut (D5), the code version.
 """
 
 import argparse
+import getpass
 import sqlite3
 import subprocess
 import sys
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 from src import calculo, extractor, loader
@@ -86,14 +91,35 @@ def _args(argv):
     p.add_argument("--db", required=True)
     p.add_argument("--sin-seed", action="store_true", help="tables only, no synthetic data")
 
-    p = sub.add_parser("calcular", help="calculate and save one result")
+    def calculo_args(p):
+        p.add_argument("--db", required=True)
+        p.add_argument("--tipo", choices=["GES"], required=True)
+        p.add_argument("--codigo", default="GES01", help="GES problem code (default: GES01)")
+        p.add_argument("--ahora", type=datetime.fromisoformat, help="calculation time (default: now)")
+        p.add_argument("--conocido-hasta", type=datetime.fromisoformat,
+                       help="only use data received up to this moment (default: --ahora)")
+
+    p = sub.add_parser("calcular", help="calculate one beneficiary; saves a new version only if it changed")
+    p.add_argument("--beneficiario", type=int, required=True)
+    calculo_args(p)
+
+    p = sub.add_parser("recalcular-todos", help="calculate every beneficiary")
+    calculo_args(p)
+
+    p = sub.add_parser("cargar-regla-ges", help="load a new GES rule version (future or retroactive)")
+    p.add_argument("--db", required=True)
+    p.add_argument("--codigo", required=True)
+    p.add_argument("--desde", type=date.fromisoformat, required=True, help="valid_from, YYYY-MM-DD")
+    p.add_argument("--tope-uf", type=float, required=True)
+    p.add_argument("--tope-cotizaciones", type=int, default=29)
+    p.add_argument("--fuente", required=True, help="where the rule comes from, e.g. the decree")
+    p.add_argument("--cargado-por", default=getpass.getuser())
+    p.add_argument("--ahora", type=datetime.fromisoformat, help="load time (default: now)")
+
+    p = sub.add_parser("historial", help="every saved version for a beneficiary")
     p.add_argument("--db", required=True)
     p.add_argument("--beneficiario", type=int, required=True)
     p.add_argument("--tipo", choices=["GES"], required=True)
-    p.add_argument("--codigo", default="GES01", help="GES problem code (default: GES01)")
-    p.add_argument("--ahora", type=datetime.fromisoformat, help="calculation time (default: now)")
-    p.add_argument("--conocido-hasta", type=datetime.fromisoformat,
-                   help="only use data received up to this moment (default: --ahora)")
     return ap.parse_args(argv)
 
 
@@ -118,17 +144,34 @@ def main(argv=None) -> int:
         return 1
     conn = extractor.conectar(db)
     try:
-        ahora = args.ahora or datetime.now().replace(microsecond=0)
-        salida = calcular(conn, args.beneficiario, args.tipo, ahora, args.conocido_hasta,
-                          args.codigo, version_codigo())
-        if salida is None:
-            print(f"beneficiary {args.beneficiario} has no qualifying {args.codigo} copagos: nothing to calculate")
+        ahora = getattr(args, "ahora", None) or datetime.now().replace(microsecond=0)
+        if args.comando == "calcular":
+            salida = calcular(conn, args.beneficiario, args.tipo, ahora, args.conocido_hasta,
+                              args.codigo, version_codigo())
+            if salida is None:
+                print(f"beneficiary {args.beneficiario} has no qualifying {args.codigo} copagos: nothing to calculate")
+                return 0
+            cid, motivo = salida
+            if motivo == "sin_cambios":
+                print(f"no changes since result #{cid}: nothing saved\n")
+            print(loader.reporte_texto(extractor.leer_resultado(conn, cid)))
             return 0
-        cid, motivo = salida
-        if motivo == "sin_cambios":
-            print(f"no changes since result #{cid}: nothing saved\n")
-        print(loader.reporte_texto(extractor.leer_resultado(conn, cid)))
-        return 0
+
+        if args.comando == "recalcular-todos":
+            return _recalcular_todos(conn, args, ahora)
+
+        if args.comando == "cargar-regla-ges":
+            rid = loader.cargar_regla_ges(conn, args.codigo, args.desde, args.tope_cotizaciones, args.tope_uf,
+                                          args.fuente, args.cargado_por, ahora)
+            print(f"loaded rule {rid}. {args.codigo} versions now:")
+            for r in extractor.leer_reglas_ges(conn, args.codigo):
+                print(f"  {r.regla_id:>3}  {r.valid_from} → {str(r.valid_to or 'open'):<10}  tope {r.tope_uf} UF")
+            print("run `recalcular-todos` to apply it to saved results")
+            return 0
+
+        if args.comando == "historial":
+            print(loader.reporte_historial(extractor.leer_historial(conn, args.beneficiario, args.tipo)))
+            return 0
     except (LookupError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -137,6 +180,24 @@ def main(argv=None) -> int:
         return 1
     finally:
         conn.close()
+
+
+def _recalcular_todos(conn, args, ahora) -> int:
+    """Calculate every beneficiary; one line each. Keeps going past errors, exit 1 if any."""
+    version, errores = version_codigo(), 0
+    for bid in extractor.leer_ids_beneficiarios(conn):
+        try:
+            salida = calcular(conn, bid, args.tipo, ahora, args.conocido_hasta, args.codigo, version)
+        except (LookupError, ValueError) as e:
+            errores += 1
+            print(f"  beneficiary {bid}: ERROR {e}")
+            continue
+        if salida is None:
+            print(f"  beneficiary {bid}: nothing to calculate")
+        else:
+            cid, motivo = salida
+            print(f"  beneficiary {bid}: {motivo:<18} result #{cid}")
+    return 1 if errores else 0
 
 
 if __name__ == "__main__":

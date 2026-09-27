@@ -174,6 +174,18 @@ def leer_resultado_vigente(conn, beneficiario_id: int, tipo: str) -> tuple[int, 
     )
 
 
+def leer_historial(conn, beneficiario_id: int, tipo: str) -> list[dict]:
+    """Every saved version for a beneficiary and tipo, oldest first."""
+    return [dict(f) for f in conn.execute(
+        """
+        SELECT id, version_calculo, vigente, motivo_recalculo, regla_version_id, ventana_inicio,
+               ventana_fin, deducible_aplicado, acumulado, fecha_cruce, calculado_en, conocido_hasta
+        FROM calculos_resultado WHERE beneficiario_id = ? AND tipo = ? ORDER BY version_calculo
+        """,
+        (beneficiario_id, tipo),
+    )]
+
+
 def leer_ids_beneficiarios(conn) -> list[int]:
     return [f["beneficiario_id"] for f in conn.execute("SELECT beneficiario_id FROM beneficiarios ORDER BY 1")]
 
