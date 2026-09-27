@@ -103,7 +103,7 @@ Defaults for lite. List them in the README.
 
 | Step | Content | Done when |
 |---|---|---|
-| **S01** | `sql/schema.sql`: every table from §4 plus D4, D6, `CHECK (monto_copago >= 0)`, `CHECK (valid_to IS NULL OR valid_from < valid_to)`, `PRAGMA foreign_keys = ON`. | `sqlite3 :memory: < sql/schema.sql` runs. |
+| **S01** | `sql/schema.sql`: every table from §4 plus D4, D6, `CHECK (monto_copago >= 0)`, `CHECK (valid_to IS NULL OR valid_from <= valid_to)` (inclusive; was `<` until S10), `PRAGMA foreign_keys = ON`. | `sqlite3 :memory: < sql/schema.sql` runs. |
 | **S02** | `sql/seed.sql`: `GES01` in two versions (2025: UF 122, closed 2025-12-31; 2026: UF 130, open), one CAEC rule, month-end UF 2025-01 → 2026-12, 2 beneficiaries, ~10 prestaciones including one late arrival. | Loads on top of the schema. |
 | **S03** | `src/calculo.py` + `tests/test_calculo.py` + `runner.ipynb` + `requirements-dev.txt`: dataclasses `ReglaGES`, `ReglaCAEC`, `Prestacion`; `regla_vigente`, `deducible_ges_uf`, `uf_a_clp`, `desglose` (§7.4). Tests: rule boundary (§8.2), gap returns `None`, split invariants, idempotence, and the **`ast` guard** on `calculo.py` imports. | Green. |
 | **S04** | `src/extractor.py` + `src/loader.py`: `conectar`, `inicializar`, `leer_beneficiario`, `leer_prestaciones` (D5), `leer_reglas_ges`, `leer_uf(fecha)` (raises if missing; GES needs it in S05); `guardar_resultado` writes header + detail in one transaction (`version_calculo = 1` for now). `calculo.py` gains the data it needs: `Beneficiario`, `Resultado`, `fecha_cruce`. DB tests in `test_motor.py` on in-memory SQLite. | Green. |
@@ -130,7 +130,7 @@ Skipped for now; phases 3–4 don't depend on it. Pick it up by doing S06–S07 
 
 | Step | Content | Done when |
 |---|---|---|
-| **S10** | `calculo.py`: `motivo_recalculo(anterior, nuevo)`, `validar_reglas` (§8.1), `chequear_datos` (§8.3). One test per reason and per validation failure. | Green. |
+| **S10** | `calculo.py`: `motivo_recalculo(anterior, nuevo)` (inicial / sin_cambios / ventana_desplazada / cambio_normativo / correccion / datos_tardios), `validar_reglas` (§8.1), `chequear_datos` (§8.3), and `planear_nueva_version` (the pure half of `cargar_regla`: which version to close and where the new one ends, for future and retroactive changes alike). One test per reason and per validation failure. Found and fixed: validity is inclusive, so a one-day version (`valid_from = valid_to`) is valid. | Green. |
 | **S11** | `loader.py`: versioned `guardar_resultado` (mark previous `vigente = 0`, insert `prev + 1`; write nothing if unchanged) and `cargar_regla` (close open version, insert, validate, roll back on failure). `extractor.py`: `leer_resultado_vigente`. | — |
 | **S12** | `motor.py`: `cargar-regla-ges`, `recalcular-todos`, `calcular` stores `motivo`. `test_motor.py`: the four scenarios — (1) no change → no new version; (2) late prestación inside window → `datos_tardios` with the **historical** rule; (3) late prestación before window → `ventana_desplazada`; (4) retroactive rule → `cambio_normativo`, old row kept with `vigente = 0`. | Green. **Tag `v0.4-recalculo`.** |
 

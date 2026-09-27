@@ -236,3 +236,102 @@ def calcular_ges(beneficiario: Beneficiario, prestaciones, reglas, codigo_ges: s
         fecha_cruce=fecha_cruce(filas, deducible),
         filas=filas,
     )
+
+
+# ───────────────────────────────────────────────────────────
+# Recalculation (spec §6)
+# ───────────────────────────────────────────────────────────
+
+def motivo_recalculo(anterior: Resultado | None, nuevo: Resultado) -> str:
+    """Why `nuevo` differs from the current result. Checked in order of what moved first:
+
+    inicial            no previous result
+    sin_cambios        identical: nothing should be written (idempotence)
+    ventana_desplazada the window start moved (an earlier copago arrived)
+    cambio_normativo   same window, different rule version
+    correccion         same window and rule, different deductible (UF or cotización fixed)
+    datos_tardios      same window, rule and deductible; the prestaciones changed
+    """
+    if anterior is None:
+        return "inicial"
+    if anterior == nuevo:
+        return "sin_cambios"
+    if anterior.ventana_inicio != nuevo.ventana_inicio:
+        return "ventana_desplazada"
+    if anterior.regla_version_id != nuevo.regla_version_id:
+        return "cambio_normativo"
+    if anterior.deducible_aplicado != nuevo.deducible_aplicado:
+        return "correccion"
+    return "datos_tardios"
+
+
+# ───────────────────────────────────────────────────────────
+# Rule-set validation (spec §8.1) and rule loading
+# ───────────────────────────────────────────────────────────
+
+def validar_reglas(reglas) -> list[str]:
+    """Problems in a GES rule set; empty list = valid. Run at load time, not at use time."""
+    problemas = []
+    for codigo in sorted({r.codigo_ges for r in reglas}):
+        versiones = sorted((r for r in reglas if r.codigo_ges == codigo), key=lambda r: r.valid_from)
+        for r in versiones:
+            if r.valid_to is not None and r.valid_to < r.valid_from:
+                problemas.append(f"{codigo}: rule {r.regla_id} ends before it starts")
+        for prev, sig in zip(versiones, versiones[1:]):
+            if prev.valid_to is None or sig.valid_from <= prev.valid_to:
+                problemas.append(f"{codigo}: rules {prev.regla_id} and {sig.regla_id} overlap")
+            elif sig.valid_from > prev.valid_to + timedelta(days=1):
+                problemas.append(f"{codigo}: gap between rules {prev.regla_id} and {sig.regla_id} "
+                                 f"({prev.valid_to + timedelta(days=1)} → {sig.valid_from - timedelta(days=1)})")
+        abiertas = [r for r in versiones if r.valid_to is None]
+        if len(abiertas) != 1:
+            problemas.append(f"{codigo}: {len(abiertas)} open versions, expected exactly 1")
+    return problemas
+
+
+def planear_nueva_version(reglas, codigo_ges: str, valid_from: date) -> tuple[list[tuple[int, date]], date | None]:
+    """Where a new version starting `valid_from` fits into the existing ones.
+
+    Returns (closings, valid_to_of_new): the version that contains `valid_from`
+    is closed the day before, and the new one takes over until that version's
+    old end. Before every existing version, it runs up to the first one.
+    Works the same for a future change and a retroactive one.
+    """
+    versiones = sorted((r for r in reglas if r.codigo_ges == codigo_ges), key=lambda r: r.valid_from)
+    if any(r.valid_from == valid_from for r in versiones):
+        raise ValueError(f"A {codigo_ges} version already starts on {valid_from}; "
+                         "correcting an existing version is out of scope")
+    contenedora = next((r for r in versiones if _vigente_en(r, valid_from)), None)
+    if contenedora is not None:
+        return [(contenedora.regla_id, valid_from - timedelta(days=1))], contenedora.valid_to
+    posteriores = [r for r in versiones if r.valid_from > valid_from]
+    if posteriores:
+        return [], posteriores[0].valid_from - timedelta(days=1)
+    return [], None
+
+
+# ───────────────────────────────────────────────────────────
+# Data checks (spec §8.3): run on every calculation, reported, not blocking
+# ───────────────────────────────────────────────────────────
+
+COPAGO_MAX_GES = 0.20   # §5.1: GES copago is at most 20% of the arancel
+
+
+def chequear_datos(prestaciones, reglas) -> list[str]:
+    """Warnings about the data a calculation saw. Empty list = clean."""
+    avisos = []
+    codigos_con_regla = {r.codigo_ges for r in reglas}
+    for p in sorted(prestaciones, key=lambda p: p.prestacion_id):
+        if p.monto_copago < 0 or p.monto_arancel < 0:
+            avisos.append(f"prestación {p.prestacion_id}: negative amount")
+        if p.monto_copago > p.monto_arancel:
+            avisos.append(f"prestación {p.prestacion_id}: copago {p.monto_copago:,} > arancel {p.monto_arancel:,}")
+        if p.codigo_ges is None:
+            continue
+        if p.monto_copago > COPAGO_MAX_GES * p.monto_arancel:
+            avisos.append(f"prestación {p.prestacion_id}: GES copago above 20% of the arancel")
+        if p.codigo_ges not in codigos_con_regla:
+            avisos.append(f"prestación {p.prestacion_id}: code {p.codigo_ges} has no rules")
+        elif regla_vigente(p.codigo_ges, p.fecha_prestacion, reglas) is None:
+            avisos.append(f"prestación {p.prestacion_id}: no {p.codigo_ges} rule in force on {p.fecha_prestacion}")
+    return avisos

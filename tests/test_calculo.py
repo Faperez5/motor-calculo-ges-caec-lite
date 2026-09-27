@@ -12,6 +12,7 @@ from src.calculo import (
     ReglaGES,
     Beneficiario,
     calcular_ges,
+    chequear_datos,
     deducible_ges_uf,
     derivar_ventana,
     desglose,
@@ -19,8 +20,11 @@ from src.calculo import (
     fecha_cruce,
     fecha_uf,
     filtrar_ges,
+    motivo_recalculo,
+    planear_nueva_version,
     regla_vigente,
     uf_a_clp,
+    validar_reglas,
 )
 
 # Same two GES01 versions as sql/seed.sql.
@@ -302,6 +306,149 @@ def test_calcular_ges_rechaza_prestaciones_de_otro_beneficiario():
 
 def test_calcular_ges_es_idempotente():
     assert calcular_ges(BEN_1, PRESTACIONES, REGLAS, "GES01", UF) == calcular_ges(BEN_1, PRESTACIONES, REGLAS, "GES01", UF)
+
+
+# ───────────────────────────────────────────────────────────
+# motivo_recalculo — one test per reason
+# ───────────────────────────────────────────────────────────
+
+BASE = calcular_ges(BEN_1, PRESTACIONES, REGLAS, "GES01", UF)
+
+
+def test_motivo_inicial():
+    assert motivo_recalculo(None, BASE) == "inicial"
+
+
+def test_motivo_sin_cambios():
+    assert motivo_recalculo(BASE, calcular_ges(BEN_1, PRESTACIONES, REGLAS, "GES01", UF)) == "sin_cambios"
+
+
+def test_motivo_ventana_desplazada():
+    uf = {**UF, date(2025, 1, 31): 38_515.20}
+    nuevo = calcular_ges(BEN_1, PRESTACIONES + [prestacion(20, date(2025, 2, 5), 1)], REGLAS, "GES01", uf)
+    assert motivo_recalculo(BASE, nuevo) == "ventana_desplazada"
+
+
+def test_motivo_cambio_normativo():
+    reglas = [replace(REGLA_2025, valid_to=date(2025, 2, 28)),
+              ReglaGES(3, "GES01", date(2025, 3, 1), date(2025, 12, 31), 29, 125.0), REGLA_2026]
+    assert motivo_recalculo(BASE, calcular_ges(BEN_1, PRESTACIONES, reglas, "GES01", UF)) == "cambio_normativo"
+
+
+def test_motivo_correccion():
+    nuevo = calcular_ges(BEN_1, PRESTACIONES, REGLAS, "GES01", {date(2025, 2, 28): 38_700.0})
+    assert motivo_recalculo(BASE, nuevo) == "correccion"
+
+
+def test_motivo_datos_tardios():
+    sin_tardio = calcular_ges(BEN_1, [p for p in PRESTACIONES if p.prestacion_id != 7], REGLAS, "GES01", UF)
+    assert motivo_recalculo(sin_tardio, BASE) == "datos_tardios"
+
+
+# ───────────────────────────────────────────────────────────
+# validar_reglas (spec §8.1)
+# ───────────────────────────────────────────────────────────
+
+def test_reglas_del_seed_son_validas():
+    assert validar_reglas(REGLAS) == []
+
+
+def test_validar_detecta_solapamiento():
+    malas = [REGLA_2025, ReglaGES(2, "GES01", date(2025, 12, 1), None, 29, 130.0)]
+    assert any("overlap" in p for p in validar_reglas(malas))
+
+
+def test_validar_detecta_hueco():
+    malas = [REGLA_2025, ReglaGES(2, "GES01", date(2026, 2, 1), None, 29, 130.0)]
+    assert any("gap" in p for p in validar_reglas(malas))
+
+
+def test_validar_detecta_dos_versiones_abiertas():
+    malas = [replace(REGLA_2025, valid_to=None), REGLA_2026]
+    problemas = validar_reglas(malas)
+    assert any("2 open" in p for p in problemas) and any("overlap" in p for p in problemas)
+
+
+def test_validar_detecta_ninguna_version_abierta():
+    assert any("0 open" in p for p in validar_reglas([REGLA_2025]))
+
+
+def test_validar_detecta_fechas_invertidas():
+    malas = [ReglaGES(1, "GES01", date(2025, 6, 1), date(2025, 1, 1), 29, 122.0), REGLA_2026]
+    assert any("ends before it starts" in p for p in validar_reglas(malas))
+
+
+def test_version_de_un_dia_es_valida():
+    reglas = [REGLA_2025, ReglaGES(2, "GES01", date(2026, 1, 1), date(2026, 1, 1), 29, 130.0),
+              ReglaGES(3, "GES01", date(2026, 1, 2), None, 29, 135.0)]
+    assert validar_reglas(reglas) == []
+
+
+# ───────────────────────────────────────────────────────────
+# planear_nueva_version
+# ───────────────────────────────────────────────────────────
+
+def test_nueva_version_futura_cierra_la_abierta():
+    assert planear_nueva_version(REGLAS, "GES01", date(2027, 1, 1)) == ([(2, date(2026, 12, 31))], None)
+
+
+def test_nueva_version_retroactiva_parte_la_que_la_contiene():
+    assert planear_nueva_version(REGLAS, "GES01", date(2025, 3, 1)) == (
+        [(1, date(2025, 2, 28))], date(2025, 12, 31))
+
+
+def test_nueva_version_anterior_a_todas_llega_hasta_la_primera():
+    assert planear_nueva_version(REGLAS, "GES01", date(2024, 1, 1)) == ([], date(2024, 12, 31))
+
+
+def test_primera_version_de_un_codigo_queda_abierta():
+    assert planear_nueva_version(REGLAS, "GES02", date(2025, 1, 1)) == ([], None)
+
+
+def test_nueva_version_el_mismo_dia_que_otra_falla():
+    with pytest.raises(ValueError, match="already starts"):
+        planear_nueva_version(REGLAS, "GES01", date(2026, 1, 1))
+
+
+@pytest.mark.parametrize("desde", [date(2024, 1, 1), date(2025, 3, 1), date(2026, 1, 2), date(2027, 1, 1)])
+def test_aplicar_el_plan_deja_un_set_valido(desde):
+    cierres, hasta = planear_nueva_version(REGLAS, "GES01", desde)
+    nuevo_to = dict(cierres)
+    reglas = [replace(r, valid_to=nuevo_to.get(r.regla_id, r.valid_to)) for r in REGLAS]
+    reglas.append(ReglaGES(99, "GES01", desde, hasta, 29, 140.0))
+    assert validar_reglas(reglas) == []
+
+
+# ───────────────────────────────────────────────────────────
+# chequear_datos (spec §8.3)
+# ───────────────────────────────────────────────────────────
+
+def test_datos_del_seed_estan_limpios():
+    assert chequear_datos(PRESTACIONES, REGLAS) == []
+
+
+def test_chequear_copago_mayor_que_arancel():
+    avisos = chequear_datos([prestacion(1, date(2025, 3, 1), 1_000, arancel=500)], REGLAS)
+    assert any("> arancel" in a for a in avisos)
+
+
+def test_chequear_copago_ges_sobre_20_por_ciento():
+    avisos = chequear_datos([prestacion(1, date(2025, 3, 1), 300, arancel=1_000)], REGLAS)
+    assert any("20%" in a for a in avisos)
+
+
+def test_chequear_prestacion_sin_regla_vigente():
+    avisos = chequear_datos([prestacion(1, date(2024, 6, 1), 100)], REGLAS)
+    assert any("no GES01 rule in force" in a for a in avisos)
+
+
+def test_chequear_codigo_huerfano():
+    avisos = chequear_datos([replace(prestacion(1, date(2025, 6, 1), 100), codigo_ges="GES77")], REGLAS)
+    assert any("GES77 has no rules" in a for a in avisos)
+
+
+def test_chequear_ignora_reglas_ges_en_no_ges():
+    assert chequear_datos([replace(prestacion(1, date(2024, 6, 1), 300, arancel=1_000), codigo_ges=None)], REGLAS) == []
 
 
 # ───────────────────────────────────────────────────────────

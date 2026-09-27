@@ -23,7 +23,7 @@ CREATE TABLE parametros_ges (
     fuente            TEXT,                    -- which decree
     cargado_por       TEXT,
     cargado_en        TIMESTAMP NOT NULL,
-    CHECK (valid_to IS NULL OR valid_from < valid_to)
+    CHECK (valid_to IS NULL OR valid_from <= valid_to)   -- inclusive: a one-day version is valid
 );
 
 CREATE UNIQUE INDEX ux_parametros_ges_abierta
@@ -41,7 +41,7 @@ CREATE TABLE parametros_caec (
     fuente            TEXT,
     cargado_por       TEXT,
     cargado_en        TIMESTAMP NOT NULL,
-    CHECK (valid_to IS NULL OR valid_from < valid_to),
+    CHECK (valid_to IS NULL OR valid_from <= valid_to),  -- inclusive: a one-day version is valid
     CHECK (piso_uf <= techo_base_uf AND techo_base_uf <= techo_multiple_uf)
 );
 
