@@ -1,7 +1,8 @@
-"""Read side of the engine: SQLite rows in, calculo dataclasses out.
+"""EXTRACT: SQLite (and, from phase 5, Excel) rows in, calculo dataclasses out.
 
-Impure by design (it does I/O), but it only reads. The one thing it knows
-about the rest of the engine is the dataclasses in calculo.
+Impure by design (it does I/O), but read-only: every write goes through
+loader. The one thing it knows about the rest of the engine is the
+dataclasses in calculo.
 """
 
 import sqlite3

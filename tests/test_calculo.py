@@ -190,7 +190,7 @@ def test_fecha_cruce_exacta_en_el_umbral():
 # Architecture guard: calculo.py stays pure
 # ───────────────────────────────────────────────────────────
 
-PROHIBIDOS_IMPORT = {"sqlite3", "os", "io", "pathlib", "openpyxl", "repositorio", "persistencia", "motor"}
+PROHIBIDOS_IMPORT = {"sqlite3", "os", "io", "pathlib", "openpyxl", "extractor", "loader", "motor"}
 PROHIBIDAS_LLAMADAS = {"now", "today", "utcnow", "open"}
 
 

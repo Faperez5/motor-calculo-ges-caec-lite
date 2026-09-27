@@ -3,7 +3,7 @@
 -- Conventions:
 --   * Dates are ISO text 'YYYY-MM-DD'; timestamps are ISO text 'YYYY-MM-DDTHH:MM:SS'.
 --   * CLP amounts are INTEGER pesos; UF amounts are REAL (plan D4).
---   * foreign_keys is a per-connection setting: repositorio.conectar() must turn
+--   * foreign_keys is a per-connection setting: extractor.conectar() must turn
 --     it on too. The PRAGMA here only covers the session that runs this file.
 
 PRAGMA foreign_keys = ON;

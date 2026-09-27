@@ -1,4 +1,7 @@
-"""Write side of the engine: stores results. Never updates facts or rules.
+"""LOAD: every write to the database, and later the Excel/Word reports.
+
+Results are versioned, never overwritten. Facts (prestaciones) are
+append-only. Rules only change through cargar_regla (S11, plan D10).
 
 Phase 1: every result is version 1 and current. Versioning, idempotence and
 motivo detection arrive in S11.
