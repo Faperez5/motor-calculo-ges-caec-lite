@@ -208,6 +208,43 @@ def test_derivar_ventana_desde_el_primer_copago():
     assert derivar_ventana(PRESTACIONES) == (date(2025, 3, 10), date(2026, 3, 9))
 
 
+def test_derivar_ventana_fin_de_mes():
+    assert derivar_ventana([prestacion(1, date(2025, 1, 31), 1)]) == (date(2025, 1, 31), date(2026, 1, 30))
+
+
+def test_derivar_ventana_termina_en_29_de_febrero_si_corresponde():
+    assert derivar_ventana([prestacion(1, date(2023, 3, 1), 1)])[1] == date(2024, 2, 29)
+
+
+def test_derivar_ventana_que_parte_un_29_de_febrero_termina_el_28():
+    assert derivar_ventana([prestacion(1, date(2024, 2, 29), 1)]) == (date(2024, 2, 29), date(2025, 2, 28))
+
+
+def test_ventana_se_desplaza_con_dato_anterior():
+    v1 = derivar_ventana(PRESTACIONES)
+    v2 = derivar_ventana(PRESTACIONES + [prestacion(20, date(2025, 2, 5), 500_000)])
+    assert v2[0] < v1[0]
+    assert v2 == (date(2025, 2, 5), date(2026, 2, 4))
+
+
+def test_ventana_desplazada_saca_prestaciones_que_estaban_dentro():
+    tardio = prestacion(20, date(2025, 2, 5), 500_000)
+    antes = {p.prestacion_id for p in en_ventana(PRESTACIONES, derivar_ventana(PRESTACIONES))}
+    todas = PRESTACIONES + [tardio]
+    despues = {p.prestacion_id for p in en_ventana(todas, derivar_ventana(todas))}
+    assert 8 in antes and 8 not in despues      # 2026-02-10 falls off the new end (2026-02-04)
+    assert 20 in despues                        # the late arrival itself is now the start
+
+
+def test_ventana_desplazada_mueve_el_cruce():
+    uf = {**UF, date(2025, 1, 31): 38_515.20}
+    antes = calcular_ges(BEN_1, PRESTACIONES, REGLAS, "GES01", UF)
+    despues = calcular_ges(BEN_1, PRESTACIONES + [prestacion(20, date(2025, 2, 5), 500_000)], REGLAS, "GES01", uf)
+    assert antes.fecha_cruce == date(2025, 11, 20)
+    # UF(2025-01-31) → deductible 4 698 854; 0.5+1.0+1.2+1.5+0.8 = 5.0M crosses on 2025-10-15
+    assert (despues.deducible_aplicado, despues.fecha_cruce) == (4_698_854, date(2025, 10, 15))
+
+
 def test_derivar_ventana_vacia_es_none():
     assert derivar_ventana([]) is None
 

@@ -11,8 +11,6 @@ happens in uf_a_clp (plan D4).
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
-from dateutil.relativedelta import relativedelta
-
 
 # ───────────────────────────────────────────────────────────
 # Data
@@ -171,11 +169,19 @@ def filtrar_ges(prestaciones, codigo_ges: str) -> list[Prestacion]:
 
 
 def derivar_ventana(prestaciones) -> tuple[date, date] | None:
-    """12 months from the first known qualifying copago. Moves if an earlier one shows up."""
+    """12 months from the first known qualifying copago. Moves if an earlier one shows up.
+
+    Ends the day before the anniversary. A window starting Feb 29 has its
+    anniversary on Mar 1, so it ends Feb 28 (plan D11).
+    """
     if not prestaciones:
         return None
     inicio = min(p.fecha_prestacion for p in prestaciones)
-    return inicio, inicio + relativedelta(months=12) - timedelta(days=1)
+    try:
+        aniversario = inicio.replace(year=inicio.year + 1)
+    except ValueError:  # Feb 29 → no such day next year
+        aniversario = date(inicio.year + 1, 3, 1)
+    return inicio, aniversario - timedelta(days=1)
 
 
 def en_ventana(prestaciones, ventana: tuple[date, date]) -> list[Prestacion]:

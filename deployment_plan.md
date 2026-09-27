@@ -63,7 +63,7 @@ It's an ETL pipeline: **extract** (`extractor`), **transform** (`calculo`), **lo
 
 ```
 motor.py ──► extractor.py ──► sqlite3 / openpyxl
-   ├──────► calculo.py          (stdlib + dateutil only)
+   ├──────► calculo.py          (stdlib only)
    └──────► loader.py ──► sqlite3 (later: Excel / Word reports)
 ```
 
@@ -87,6 +87,7 @@ Defaults for lite. List them in the README.
 | D8 | Calculation date | Passed in via `--ahora` (default: now). Never read inside `calculo.py`. |
 | D9 | Period close (§6) | Not implemented. Every recalculation creates a new version. |
 | D10 | How rules get into the database | Only through `loader.cargar_regla` (S11), which closes the previous version, fills `cargado_por`/`cargado_en`, runs `validar_reglas`, and rolls back on failure. No manual `INSERT`/`UPDATE` on rule tables (§3.3), and no Excel "master" that gets edited in place. Excel is fine as an **input format** (one file or row per change) fed through the same loader (S14). |
+| D11 | Window ending when it starts on Feb 29 | The window ends the day before the anniversary; a Feb 29 start's anniversary is Mar 1, so 2024-02-29 → 2025-02-28 (the spec formula in §7.5 would give 2025-02-27). |
 
 ---
 
@@ -96,7 +97,7 @@ Defaults for lite. List them in the README.
 
 | Step | Content | Done when |
 |---|---|---|
-| **S00** | `git init`, `gh repo create Faperez5/motor-calculo-ges-caec-lite --private --source . --push`. Add `.gitignore` (`__pycache__/`, `.venv/`, `.pytest_cache/`, `*.db`, `data/*.xlsx`), `requirements.txt` (`python-dateutil`, `pytest`, then `pip freeze`), a README stub, and the spec + this plan. | Remote exists; fresh venv installs cleanly. |
+| **S00** | `git init`, `gh repo create Faperez5/motor-calculo-ges-caec-lite --private --source . --push`. Add `.gitignore` (`__pycache__/`, `.venv/`, `.pytest_cache/`, `*.db`, `data/*.xlsx`), `requirements.txt` (`pytest`, then `pip freeze`; `python-dateutil` was dropped in S08), a README stub, and the spec + this plan. | Remote exists; fresh venv installs cleanly. |
 
 ### Phase 1 — GES vertical slice
 
@@ -108,7 +109,10 @@ Defaults for lite. List them in the README.
 | **S04** | `src/extractor.py` + `src/loader.py`: `conectar`, `inicializar`, `leer_beneficiario`, `leer_prestaciones` (D5), `leer_reglas_ges`, `leer_uf(fecha)` (raises if missing; GES needs it in S05); `guardar_resultado` writes header + detail in one transaction (`version_calculo = 1` for now). `calculo.py` gains the data it needs: `Beneficiario`, `Resultado`, `fecha_cruce`. DB tests in `test_motor.py` on in-memory SQLite. | Green. |
 | **S05** | `src/motor.py` + tests: CLI `init --db` and `calcular --db --beneficiario --tipo GES [--codigo] [--ahora] [--conocido-hasta]`. `motor` only wires E → T → L; the GES pipeline is one pure call, `calculo.calcular_ges` (filter → derived window → rule on `ventana_inicio` → deductible → split), with `derivar_ventana`, `en_ventana`, `fecha_uf` (D3). `calculos_resultado` gains `conocido_hasta` (defaults to `--ahora`) and `version_codigo` (git commit, `-dirty` if uncommitted). The trace is printed by `loader.reporte_texto` from the **saved** result. End-to-end tests on in-memory SQLite + CLI tests. | Green. **Tag `v0.1-slice`.** |
 
-### Phase 2 — CAEC
+### Phase 2 — CAEC *(deferred)*
+
+Skipped for now; phases 3–4 don't depend on it. Pick it up by doing S06–S07 as written, then add `--tipo CAEC` to `recalcular-todos`.
+
 
 | Step | Content | Done when |
 |---|---|---|
@@ -119,8 +123,8 @@ Defaults for lite. List them in the README.
 
 | Step | Content | Done when |
 |---|---|---|
-| **S08** | `calculo.py`: window-shift tests on top of the `derivar_ventana` built in S05: an earlier late arrival moves the window back, drops one prestación and adds another, and moves the crossing date. **Decide** the Feb 29 case: the spec formula (§7.5) makes a window starting 2024-02-29 end on 2025-02-27; the alternative is 2025-02-28. | Green. |
-| **S09** | `calculo.py`: merge `calcular_ges` / `calcular_caec` into one `calcular(tipo, ...)` if they've grown alike; `motor.py` calls it. Refactor only. | Existing tests still green. **Tag `v0.3-ventana`.** |
+| **S08** | `calculo.py`: window-shift tests on top of the `derivar_ventana` built in S05: an earlier late arrival moves the window back, drops a prestación off the end, and moves the crossing date. Feb 29 rule (D11), which also drops `python-dateutil` from the engine's requirements. | Green. **Tag `v0.3-ventana`.** |
+| ~~S09~~ | *Dropped.* It merged `calcular_ges` and `calcular_caec`; with CAEC deferred there's nothing to merge. Revisit with phase 2. | — |
 
 ### Phase 4 — Recalculation and versioning (§6)
 
@@ -168,8 +172,8 @@ To reproduce an old result: `git checkout v0.x-…`, recreate the venv, re-run.
 |---|---|---|
 | 0 Bootstrap | S00 | — |
 | 1 GES slice | S01–S05 | `v0.1-slice` |
-| 2 CAEC | S06–S07 | `v0.2-caec` |
-| 3 Window | S08–S09 | `v0.3-ventana` |
+| 2 CAEC *(deferred)* | S06–S07 | `v0.2-caec` |
+| 3 Window | S08 | `v0.3-ventana` |
 | 4 Recalculation | S10–S12 | `v0.4-recalculo` |
 | 5 Excel | S13–S14 | `v0.5-ingesta` |
 | 6 CI | S15–S16 | `v1.0-lite` |
