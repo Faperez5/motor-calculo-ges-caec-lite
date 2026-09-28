@@ -6,6 +6,7 @@ or regulatory reference.
 
 - Spec: [`motor_calculo_ges_caec_spec.md`](motor_calculo_ges_caec_spec.md)
 - Build plan: [`deployment_plan.md`](deployment_plan.md)
+- User guide (commands, calculation rules, Excel formats): [`user_guide.md`](user_guide.md)
 
 ## Setup
 

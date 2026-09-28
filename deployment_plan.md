@@ -11,7 +11,7 @@
 | Rule | What it means in practice |
 |---|---|
 | **Small commits** | Each step is one commit: the code change plus its tests. Commit message: `S<nn>: <what>`. |
-| **Few files** | 14 files total (§1). Helpers go in an existing module. |
+| **Few files** | 15 files total (§1). Helpers go in an existing module. |
 | **Notebook is a front end** | `runner.ipynb` only calls code in `src/`; it holds no logic of its own. Clear its outputs before committing. Each step that adds something runnable adds a cell. |
 | **Pure core** | `calculo.py` has no `sqlite3`, no `open()`, no `datetime.now()`, and doesn't import `extractor` or `loader`. A test enforces this. |
 | **Suite stays green** | `python -m pytest -q` before every push. |
@@ -38,6 +38,7 @@ A container adds a file, a build step, and a tool to install, and it doesn't buy
 ```
 motor-ges-caec-lite/
 ├── README.md
+├── user_guide.md               # commands, calculation rules, Excel formats
 ├── requirements.txt            # pinned (pip freeze): what the engine needs
 ├── requirements-dev.txt        # + ipykernel, to run the notebook
 ├── runner.ipynb                # interactive runner: tests + calls into src/
@@ -180,4 +181,4 @@ To reproduce an old result: `git checkout v0.x-…`, recreate the venv, re-run.
 | 5 Excel | S13–S14 | `v0.5-ingesta` |
 | 6 CI | S15–S16 | `v1.0-lite` |
 
-18 commits, 14 files, 3 layers, 1 SQLite database, no containers.
+18 commits, 15 files, 3 layers, 1 SQLite database, no containers.
