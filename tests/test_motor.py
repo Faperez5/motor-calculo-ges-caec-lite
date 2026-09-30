@@ -190,6 +190,28 @@ def test_conocido_hasta_posterior_a_ahora_falla(conn):
         motor.calcular(conn, 1, "GES", AHORA, conocido_hasta=datetime(2027, 1, 1))
 
 
+def test_guardar_rechaza_un_resultado_que_sabe_menos_que_el_vigente(conn):
+    r = _resultado_ben1(conn)
+    loader.guardar_resultado(conn, r, "inicial", AHORA, AHORA, "abc123")
+    with pytest.raises(ValueError, match="--simular"):
+        loader.guardar_resultado(conn, r, "datos_tardios", AHORA, datetime(2026, 3, 4), "abc123")
+    assert conn.execute("SELECT count(*), sum(vigente) FROM calculos_resultado").fetchone()[0] == 1
+
+
+def test_calcular_en_el_pasado_no_reemplaza_el_resultado_vigente(conn):
+    motor.calcular(conn, 1, "GES", AHORA)
+    with pytest.raises(ValueError):
+        motor.calcular(conn, 1, "GES", AHORA, conocido_hasta=datetime(2026, 3, 4, 23, 59))
+    assert conn.execute("SELECT count(*) FROM calculos_resultado").fetchone()[0] == 1
+
+
+def test_evaluar_ve_el_pasado_sin_escribir(conn):
+    motor.calcular(conn, 1, "GES", AHORA)
+    r, motivo, _, anterior_id = motor.evaluar(conn, 1, "GES", datetime(2026, 3, 4, 23, 59))
+    assert (r.fecha_cruce, motivo, anterior_id) == (date(2026, 2, 10), "datos_tardios", 1)   # 7 not known yet
+    assert conn.execute("SELECT count(*) FROM calculos_resultado").fetchone()[0] == 1
+
+
 def test_sin_copagos_calificados_no_escribe_nada(conn):
     assert motor.calcular(conn, 2, "GES", AHORA) is None               # beneficiary 2 has no GES rows
     assert conn.execute("SELECT count(*) FROM calculos_resultado").fetchone()[0] == 0
@@ -528,6 +550,61 @@ def test_comandos_de_lectura_no_se_registran(tmp_path, capsys):
     motor.main(["ejecuciones", "--db", db])
     assert len(_runs(db)) == 1
     assert "init --db" in capsys.readouterr().out
+
+
+def test_leer_ficha(conn):
+    motor.calcular(conn, 1, "GES", AHORA)
+    f = extractor.leer_ficha(conn, 1)
+    assert f["beneficiario"]["cotizacion_pactada_uf"] == 5.0
+    assert [p["prestacion_id"] for p in f["prestaciones"]] == list(range(1, 10))
+    assert [(r["tipo"], r["version_calculo"]) for r in f["resultados"]] == [("GES", 1)]
+
+
+def test_leer_ficha_conocido_hasta_excluye_el_dato_tardio(conn):
+    ids = [p["prestacion_id"] for p in extractor.leer_ficha(conn, 1, datetime(2026, 3, 4, 23, 59))["prestaciones"]]
+    assert 7 not in ids and 8 in ids
+
+
+def test_leer_ficha_beneficiario_inexistente(conn):
+    with pytest.raises(LookupError):
+        extractor.leer_ficha(conn, 99)
+
+
+def test_cli_ver_muestra_datos_y_resultado_vigente_sin_registrarse(tmp_path, capsys):
+    db = _db_con_seed(tmp_path)
+    assert motor.main(["ver", "--db", db, "--beneficiario", "1"]) == 0
+    out = capsys.readouterr().out
+    assert "Prestaciones: 9 (everything known now)" in out and "none saved yet" in out
+    motor.main(["calcular", "--db", db, "--beneficiario", "1", "--tipo", "GES", "--ahora", "2026-09-27T12:00"])
+    capsys.readouterr()
+    motor.main(["ver", "--db", db, "--beneficiario", "1", "--conocido-hasta", "2026-03-04T23:59"])
+    out = capsys.readouterr().out
+    assert "Prestaciones: 7 (known up to 2026-03-04T23:59:00)" in out      # not yet: 7 (late) and 9 (April)
+    assert "GES   result #1, version 1 (inicial)" in out
+    assert len(_runs(db)) == 2                                          # init + calcular; ver isn't logged
+
+
+def test_cli_simular_no_guarda_ni_se_registra(tmp_path, capsys):
+    db = _db_con_seed(tmp_path)
+    motor.main(["calcular", "--db", db, "--beneficiario", "1", "--tipo", "GES", "--ahora", "2026-09-27T12:00"])
+    capsys.readouterr()
+    assert motor.main(["calcular", "--db", db, "--beneficiario", "1", "--tipo", "GES", "--simular",
+                       "--ahora", "2026-09-27T12:00", "--conocido-hasta", "2026-03-04T23:59"]) == 0
+    out = capsys.readouterr().out
+    assert "SIMULATION, NOT SAVED" in out and "datos_tardios" in out
+    assert "data known up to 2026-03-04T23:59:00" in out and "crossed on      2026-02-10" in out
+    assert _uno(db, "SELECT count(*) FROM calculos_resultado") == 1
+    assert len(_runs(db)) == 2                                          # init + the real calcular
+
+
+def test_cli_calcular_en_el_pasado_falla_y_sugiere_simular(tmp_path, capsys):
+    db = _db_con_seed(tmp_path)
+    motor.main(["calcular", "--db", db, "--beneficiario", "1", "--tipo", "GES", "--ahora", "2026-09-27T12:00"])
+    assert motor.main(["calcular", "--db", db, "--beneficiario", "1", "--tipo", "GES",
+                       "--conocido-hasta", "2026-03-04T23:59"]) == 1
+    assert "--simular" in capsys.readouterr().err
+    assert _uno(db, "SELECT count(*) FROM calculos_resultado") == 1
+    assert _runs(db)[-1]["estado"] == "error"
 
 
 # ───────────────────────────────────────────────────────────

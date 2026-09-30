@@ -39,11 +39,21 @@ def guardar_resultado(conn, resultado: Resultado, motivo: str, calculado_en: dat
     and the new one gets version_calculo = previous + 1. If anything fails,
     nothing changes, including the previous version's vigente flag.
     `sin_cambios` is refused: an unchanged result must not create a version.
+    So is a `conocido_hasta` earlier than the current version's: a result that
+    knew less must not replace one that knew more (look at the past with
+    `calcular --simular` instead).
     """
     if motivo == "sin_cambios":
         raise ValueError("sin_cambios: nothing to save")
     clave = (resultado.beneficiario_id, resultado.tipo)
     with conn:
+        vigente = conn.execute(
+            "SELECT conocido_hasta FROM calculos_resultado WHERE beneficiario_id = ? AND tipo = ? AND vigente = 1", clave
+        ).fetchone()
+        if vigente and conocido_hasta.isoformat(timespec="seconds") < vigente[0]:
+            raise ValueError(f"the current result already knows data up to {vigente[0]}; saving one that only "
+                             f"knows up to {conocido_hasta.isoformat(timespec='seconds')} would replace it with "
+                             "less. Use --simular to look at the past")
         ultima = conn.execute(
             "SELECT max(version_calculo) FROM calculos_resultado WHERE beneficiario_id = ? AND tipo = ?", clave
         ).fetchone()[0]
@@ -172,11 +182,16 @@ def cargar_regla_ges(conn, codigo_ges: str, valid_from: date, tope_cotizaciones:
 # ───────────────────────────────────────────────────────────
 
 def reporte_texto(r: dict) -> str:
-    """Audit trace of a saved result, for the terminal."""
-    estado = "current" if r["vigente"] else "superseded"
+    """Audit trace of a saved result, for the terminal. `id` None = a simulation (reporte_simulacion)."""
+    if r["id"] is None:
+        cabecera = (f"SIMULATION, NOT SAVED — beneficiary {r['beneficiario_id']}, {r['tipo']}, "
+                    f"compared with the current result: {r['motivo_recalculo']}")
+    else:
+        estado = "current" if r["vigente"] else "superseded"
+        cabecera = (f"Result #{r['id']} — beneficiary {r['beneficiario_id']}, {r['tipo']}, "
+                    f"version {r['version_calculo']} ({estado}), motivo: {r['motivo_recalculo']}")
     lineas = [
-        f"Result #{r['id']} — beneficiary {r['beneficiario_id']}, {r['tipo']}, "
-        f"version {r['version_calculo']} ({estado}), motivo: {r['motivo_recalculo']}",
+        cabecera,
         f"  rule version    {r['regla_version_id']}",
         f"  window          {r['ventana_inicio']} → {r['ventana_fin']}",
         f"  deductible      {r['deducible_aplicado']:>12,} CLP",
@@ -193,6 +208,67 @@ def reporte_texto(r: dict) -> str:
             f"  {d['prestacion_id']:>3}  {d['fecha_prestacion']:<10}  {d['copago']:>11,}  "
             f"{d['paga_beneficiario']:>11,}  {d['cubre_seguro']:>11,}  {d['acumulado_hasta_aqui']:>11,}"
         )
+    return "\n".join(lineas)
+
+
+def reporte_simulacion(r: Resultado, motivo: str, calculado_en: datetime, conocido_hasta: datetime,
+                       version_codigo: str, advertencias=()) -> str:
+    """The same trace for a result that was never saved (`calcular --simular`).
+
+    The one report built from in-memory values, on purpose: there is nothing
+    stored to rebuild it from.
+    """
+    return reporte_texto({
+        "id": None, "beneficiario_id": r.beneficiario_id, "tipo": r.tipo, "motivo_recalculo": motivo,
+        "regla_version_id": r.regla_version_id,
+        "ventana_inicio": r.ventana_inicio.isoformat(), "ventana_fin": r.ventana_fin.isoformat(),
+        "deducible_aplicado": r.deducible_aplicado, "acumulado": r.acumulado,
+        "fecha_cruce": r.fecha_cruce.isoformat() if r.fecha_cruce else None,
+        "calculado_en": calculado_en.isoformat(timespec="seconds"),
+        "conocido_hasta": conocido_hasta.isoformat(timespec="seconds"),
+        "version_codigo": version_codigo, "advertencias": "\n".join(advertencias) or None,
+        "detalle": [
+            {"prestacion_id": f.prestacion_id, "fecha_prestacion": f.fecha.isoformat(), "copago": f.copago,
+             "paga_beneficiario": f.paga_beneficiario, "cubre_seguro": f.cubre_seguro,
+             "acumulado_hasta_aqui": f.acumulado}
+            for f in r.filas
+        ],
+    })
+
+
+def reporte_ficha(ficha: dict) -> str:
+    """One beneficiary's data as stored: who, which prestaciones (and when each arrived), current results."""
+    b = ficha["beneficiario"]
+    visto = f"known up to {ficha['conocido_hasta']}" if ficha["conocido_hasta"] else "everything known now"
+    ps = ficha["prestaciones"]
+    lineas = [
+        f"Beneficiary {b['beneficiario_id']} — cotización pactada {b['cotizacion_pactada_uf']} UF, "
+        f"CAEC referral {b['fecha_derivacion_caec'] or 'none'}",
+        "",
+        f"Prestaciones: {len(ps)} ({visto})",
+    ]
+    if ps:
+        lineas.append(f"  {'id':>3}  {'fecha':<10}  {'received':<19}  {'GES':<6}  {'net GES':<7}  {'net CAEC':<8}  "
+                      f"{'arancel':>11}  {'copago':>11}  loaded by")
+        for p in ps:
+            lineas.append(
+                f"  {p['prestacion_id']:>3}  {p['fecha_prestacion']:<10}  {p['recibido_en']:<19}  "
+                f"{p['codigo_ges'] or '-':<6}  {'yes' if p['en_red_ges'] else 'no':<7}  "
+                f"{'yes' if p['en_red_caec'] else 'no':<8}  {p['monto_arancel']:>11,}  {p['monto_copago']:>11,}  "
+                f"{'run #' + str(p['ejecucion_id']) if p['ejecucion_id'] else 'seed'}"
+            )
+        lineas.append(f"  {'total':<63}  {sum(p['monto_arancel'] for p in ps):>11,}  "
+                      f"{sum(p['monto_copago'] for p in ps):>11,}")
+    lineas += ["", "Current results"]
+    for r in ficha["resultados"]:
+        lineas.append(
+            f"  {r['tipo']:<4}  result #{r['id']}, version {r['version_calculo']} ({r['motivo_recalculo']}), "
+            f"rule {r['regla_version_id']}, window {r['ventana_inicio']} → {r['ventana_fin']}, "
+            f"deductible {r['deducible_aplicado']:,} CLP, crossed on {r['fecha_cruce'] or 'not reached'}, "
+            f"calculated at {r['calculado_en']}"
+        )
+    if not ficha["resultados"]:
+        lineas.append("  none saved yet: run `calcular`")
     return "\n".join(lineas)
 
 

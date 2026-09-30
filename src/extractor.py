@@ -66,14 +66,7 @@ def leer_prestaciones(conn, beneficiario_id: int, conocido_hasta: datetime | Non
     None means "everything known now". The filter is on recibido_en
     (transaction time), never on fecha_prestacion.
     """
-    sql = "SELECT * FROM prestaciones WHERE beneficiario_id = ?"
-    params = [beneficiario_id]
-    if conocido_hasta is not None:
-        if not isinstance(conocido_hasta, datetime):
-            raise TypeError("conocido_hasta must be a datetime, not a date: say which moment of the day")
-        sql += " AND recibido_en <= ?"
-        params.append(conocido_hasta.isoformat(timespec="seconds"))
-    sql += " ORDER BY fecha_prestacion, prestacion_id"
+    sql, params = _sql_prestaciones(beneficiario_id, conocido_hasta)
     return [
         Prestacion(
             prestacion_id=f["prestacion_id"],
@@ -88,6 +81,42 @@ def leer_prestaciones(conn, beneficiario_id: int, conocido_hasta: datetime | Non
         )
         for f in conn.execute(sql, params)
     ]
+
+
+def _sql_prestaciones(beneficiario_id: int, conocido_hasta: datetime | None) -> tuple[str, list]:
+    """The as-of query shared by leer_prestaciones and leer_ficha: filter on recibido_en (D5)."""
+    sql = "SELECT * FROM prestaciones WHERE beneficiario_id = ?"
+    params = [beneficiario_id]
+    if conocido_hasta is not None:
+        if not isinstance(conocido_hasta, datetime):
+            raise TypeError("conocido_hasta must be a datetime, not a date: say which moment of the day")
+        sql += " AND recibido_en <= ?"
+        params.append(conocido_hasta.isoformat(timespec="seconds"))
+    return sql + " ORDER BY fecha_prestacion, prestacion_id", params
+
+
+def leer_ficha(conn, beneficiario_id: int, conocido_hasta: datetime | None = None) -> dict:
+    """What the database holds for one beneficiary, for the `ver` report.
+
+    The beneficiary row, its prestaciones as known at `conocido_hasta` (None =
+    everything), and its current result per tipo (always the current ones).
+    """
+    ben = conn.execute("SELECT * FROM beneficiarios WHERE beneficiario_id = ?", (beneficiario_id,)).fetchone()
+    if ben is None:
+        raise LookupError(f"Beneficiary {beneficiario_id} does not exist")
+    return {
+        "beneficiario": dict(ben),
+        "conocido_hasta": conocido_hasta.isoformat(timespec="seconds") if conocido_hasta else None,
+        "prestaciones": [dict(f) for f in conn.execute(*_sql_prestaciones(beneficiario_id, conocido_hasta))],
+        "resultados": [dict(f) for f in conn.execute(
+            """
+            SELECT id, tipo, version_calculo, motivo_recalculo, regla_version_id, ventana_inicio, ventana_fin,
+                   deducible_aplicado, acumulado, fecha_cruce, calculado_en, conocido_hasta
+            FROM calculos_resultado WHERE beneficiario_id = ? AND vigente = 1 ORDER BY tipo
+            """,
+            (beneficiario_id,),
+        )],
+    }
 
 
 # ───────────────────────────────────────────────────────────

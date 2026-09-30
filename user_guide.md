@@ -28,6 +28,7 @@ Run every command from the project root. Every subcommand has `--help`.
 | `recalcular-todos` | yes, if changed | Runs `calcular` for every beneficiary |
 | `cargar-regla-ges` | yes | Loads a new version of a GES rule (future or retroactive) |
 | `ingerir` | yes | Loads prestaciones from an Excel export |
+| `ver` | no | One beneficiary's data: details, prestaciones (and when each arrived), current results |
 | `historial` | no | Every saved version of one beneficiary's result, and why each changed |
 | `ejecuciones` | no | The run log: every command that wrote to the database |
 
@@ -44,7 +45,7 @@ python -m src.motor init --db data/motor.db [--sin-seed]
 
 ```bash
 python -m src.motor calcular --db data/motor.db --beneficiario 1 --tipo GES \
-    [--codigo GES01] [--ahora 2026-09-27T12:00] [--conocido-hasta 2026-03-04T23:59]
+    [--codigo GES01] [--ahora 2026-09-27T12:00] [--conocido-hasta 2026-03-04T23:59] [--simular]
 ```
 
 | Option | Default | Meaning |
@@ -52,12 +53,19 @@ python -m src.motor calcular --db data/motor.db --beneficiario 1 --tipo GES \
 | `--codigo` | `GES01` | GES problem code |
 | `--ahora` | now | Calculation time stored on the result (D8) |
 | `--conocido-hasta` | `--ahora` | Only uses prestaciones with `recibido_en <=` this moment (D5). Can't be later than `--ahora` |
+| `--simular` | off | Calculates and prints, saves nothing, and isn't logged. The header reads `SIMULATION, NOT SAVED` and shows the motivo the result would have |
 
 Prints the audit trace of the saved result: rule version, window, deductible, crossing date, what data the run saw, the git commit, any data warnings, and the split for each prestación.
 
 If nothing changed, it prints `no changes since result #N: nothing saved` and shows the current result.
 
-> ⚠️ **`--conocido-hasta` in the past writes to the database.** It isn't a read-only query. If the older view differs from the current result, it's saved as the new current version. The next normal `calcular` then saves another version labelled `datos_tardios`. To explore "what did we know then" without touching the database, use a throwaway copy of the database or `runner.ipynb` §2–3.
+**Looking at the past.** To see what the engine would have said with only the data received by a given moment, use `--simular` with `--conocido-hasta`:
+
+```bash
+python -m src.motor calcular --db data/motor.db --beneficiario 1 --tipo GES --simular --conocido-hasta 2026-03-04T23:59
+```
+
+Without `--simular`, a `--conocido-hasta` earlier than the current result's is refused: saving it would replace a result with one that knew less.
 
 ### `recalcular-todos`
 
@@ -87,6 +95,19 @@ python -m src.motor ingerir --db data/motor.db --archivo data/export.xlsx --form
 ```
 
 Reads the first sheet of an `.xlsx` file and appends the rows as prestaciones, with `recibido_en = --ahora`. Rules are in §6. Existing prestaciones are never updated. Run `recalcular-todos` afterwards.
+
+### `ver`
+
+```bash
+python -m src.motor ver --db data/motor.db --beneficiario 1 [--conocido-hasta 2026-03-04T23:59]
+```
+
+Shows what the database holds for one beneficiary. Read-only, so it isn't logged.
+- The beneficiary: cotización pactada and CAEC referral date.
+- Every prestación: service date, when it was received, GES code, networks, arancel, copago, and which run loaded it (`seed`, or `run #N` from `ingerir`). A received date long after the service date marks a late arrival.
+- The current result per type. The full trace is in `calcular`, and every version is in `historial`.
+
+`--conocido-hasta` lists only the prestaciones received by that moment. The results shown are always the current ones.
 
 ### `historial` and `ejecuciones`
 
