@@ -761,3 +761,109 @@ def test_ingerir_archivo_inexistente(tmp_path, capsys):
     db = _db_con_seed(tmp_path)
     assert motor.main(["ingerir", "--db", db, "--archivo", str(tmp_path / "no.xlsx"), "--formato", "A"]) == 1
     assert "no.xlsx" in capsys.readouterr().err
+
+
+# ───────────────────────────────────────────────────────────
+# Beneficiaries sheet and the example template
+# ───────────────────────────────────────────────────────────
+
+ENC_BEN = ["ID Beneficiario", "Cotización Pactada UF", "Fecha Derivación CAEC"]
+
+
+def _libro(path, hojas):
+    """An .xlsx with named sheets: {title: [header, *rows]}."""
+    libro = openpyxl.Workbook()
+    libro.remove(libro.active)
+    for titulo, filas in hojas.items():
+        hoja = libro.create_sheet(titulo)
+        for f in filas:
+            hoja.append(f)
+    libro.save(path)
+    return path
+
+
+@pytest.mark.parametrize("crudo, esperado", [(4, 4.0), (4.5, 4.5), ("4.5", 4.5), ("4,5", 4.5), (" 3 ", 3.0)])
+def test_uf_acepta_punto_y_coma_decimal(crudo, esperado):
+    assert extractor._uf(crudo) == esperado
+
+
+@pytest.mark.parametrize("crudo", [0, -1, "abc", "1.234,5", True])
+def test_uf_rechaza(crudo):
+    with pytest.raises(ValueError):
+        extractor._uf(crudo)
+
+
+def test_sin_hoja_beneficiarios_devuelve_none(tmp_path):
+    p = _xlsx(tmp_path / "a.xlsx", ENC_A, [[1, datetime(2025, 2, 5), "GES01", "S", "N", 2_500_000, 500_000]])
+    assert extractor.leer_excel_beneficiarios(p) is None
+
+
+def test_leer_hoja_beneficiarios(tmp_path):
+    p = _libro(tmp_path / "b.xlsx", {"Beneficiarios": [
+        ENC_BEN, [3, 4.0, None], [4, "2,5", "01-03-2025"], [5, "x", None],
+    ]})
+    filas, rechazadas = extractor.leer_excel_beneficiarios(p)
+    assert [(f["beneficiario_id"], f["cotizacion_pactada_uf"], f["fecha_derivacion_caec"]) for f in filas] == [
+        (3, 4.0, None), (4, 2.5, date(2025, 3, 1))]
+    assert rechazadas[0][0] == 4 and "cotizacion_pactada_uf" in rechazadas[0][1]
+
+
+def test_la_hoja_prestaciones_se_busca_por_nombre(tmp_path):
+    p = _libro(tmp_path / "c.xlsx", {"Notas": [["nada"]],
+                                     "Prestaciones": [ENC_A, [1, datetime(2025, 2, 5), "GES01", "S", "N", 100, 20]]})
+    filas, _ = extractor.leer_excel_prestaciones(p, motor.FORMATOS["A"])
+    assert filas[0]["monto_copago"] == 20
+
+
+def test_insertar_beneficiarios_nuevo_igual_y_distinto(conn):
+    filas = [
+        {"beneficiario_id": 3, "cotizacion_pactada_uf": 4.0, "fecha_derivacion_caec": None},
+        {"beneficiario_id": 1, "cotizacion_pactada_uf": 5.0, "fecha_derivacion_caec": None},     # as in the seed
+        {"beneficiario_id": 2, "cotizacion_pactada_uf": 9.9, "fecha_derivacion_caec": None},     # seed says 3.5
+    ]
+    nuevos, iguales, rechazadas = loader.insertar_beneficiarios(conn, filas)
+    assert (nuevos, iguales) == ([3], [1])
+    assert rechazadas[0][0]["beneficiario_id"] == 2 and "different data" in rechazadas[0][1]
+    assert extractor.leer_beneficiario(conn, 2).cotizacion_pactada_uf == 3.5             # unchanged
+
+
+def test_ingerir_beneficiario_nuevo_con_sus_prestaciones_en_el_mismo_archivo(tmp_path, capsys):
+    db = _db_con_seed(tmp_path)
+    p = _libro(tmp_path / "nuevo.xlsx", {
+        "Beneficiarios": [ENC_BEN, [7, 3.0, None]],
+        "Prestaciones": [ENC_A, [7, datetime(2025, 5, 5), "GES01", "S", "N", 5_000_000, 1_000_000]],
+    })
+    assert motor.main(["ingerir", "--db", db, "--archivo", str(p), "--formato", "A"]) == 0
+    salida = capsys.readouterr().out
+    assert "[Beneficiarios]: 1 rows, 1 new" in salida and "1 rows, 1 loaded, 0 rejected" in salida
+    assert _runs(db)[-1]["mensaje"].endswith("beneficiaries: 1 new, 0 already stored, 0 rejected; 1 loaded, 0 rejected")
+    assert motor.main(["calcular", "--db", db, "--beneficiario", "7", "--tipo", "GES"]) == 0
+
+
+def test_ingerir_con_formato_equivocado_no_carga_ni_los_beneficiarios(tmp_path, capsys):
+    db = _db_con_seed(tmp_path)
+    p = _libro(tmp_path / "mal.xlsx", {"Beneficiarios": [ENC_BEN, [7, 3.0, None]],
+                                       "Prestaciones": [ENC_B, ["7", "05-05-2025", "GES01", "1", "0", "100", "20"]]})
+    assert motor.main(["ingerir", "--db", db, "--archivo", str(p), "--formato", "A"]) == 1
+    assert _uno(db, "SELECT count(*) FROM beneficiarios WHERE beneficiario_id = 7") == 0
+
+
+def test_plantilla_se_carga_y_recalcula(tmp_path, capsys):
+    db, p = _db_con_seed(tmp_path), tmp_path / "carga.xlsx"
+    assert motor.main(["plantilla", "--archivo", str(p)]) == 0
+    assert motor.main(["plantilla", "--archivo", str(p)]) == 1                       # never overwrites
+    motor.main(["recalcular-todos", "--db", db, "--tipo", "GES", "--ahora", "2026-09-27T12:00"])
+    assert motor.main(["ingerir", "--db", db, "--archivo", str(p), "--formato", "A", "--ahora", "2026-09-28T09:00"]) == 0
+    capsys.readouterr()
+    motor.main(["recalcular-todos", "--db", db, "--tipo", "GES", "--ahora", "2026-09-28T10:00"])
+    salida = capsys.readouterr().out
+    for linea in ("beneficiary 1: datos_tardios", "beneficiary 3: inicial", "beneficiary 4: inicial",
+                  "beneficiary 5: inicial"):
+        assert linea in salida
+    # 4's window starts in 2026 (rule 2); 5's deductible is capped at the 122 UF tope
+    assert _uno(db, "SELECT regla_version_id FROM calculos_resultado WHERE beneficiario_id = 4") == 2
+    assert _uno(db, "SELECT fecha_cruce FROM calculos_resultado WHERE beneficiario_id = 5") == "2025-07-30"
+    # loading it again changes nothing
+    assert motor.main(["ingerir", "--db", db, "--archivo", str(p), "--formato", "A"]) == 0
+    assert "0 new, 3 already stored" in capsys.readouterr().out
+    assert _uno(db, "SELECT count(*) FROM prestaciones") == 14 + len(loader.EJEMPLO_PRESTACIONES)

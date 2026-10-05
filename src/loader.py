@@ -1,11 +1,14 @@
-"""LOAD: every write to the database, and later the Excel/Word reports.
+"""LOAD: every write to the database, the text reports, and the Excel template.
 
 Results are versioned: a new version marks the previous one vigente = 0 and
 never overwrites it. Facts (prestaciones) are append-only (insertar_prestaciones). Rules only change
-through cargar_regla_ges (plan D10).
+through cargar_regla_ges (plan D10). Beneficiaries can be added, never changed (insertar_beneficiarios).
 """
 
 from datetime import date, datetime
+
+import openpyxl
+from openpyxl.styles import Font
 
 from src import calculo, extractor
 from src.calculo import Resultado
@@ -100,6 +103,36 @@ def guardar_resultado(conn, resultado: Resultado, motivo: str, calculado_en: dat
             ],
         )
     return calculo_id
+
+
+def insertar_beneficiarios(conn, filas: list[dict]) -> tuple[list[int], list[int], list[tuple[dict, str]]]:
+    """Add new beneficiaries. Returns (new ids, ids already stored unchanged, rejected).
+
+    One transaction. A beneficiary already stored with the same data is left
+    alone (loading the same file twice is safe); one stored with different
+    data is rejected: changing a beneficiary is out of scope.
+    """
+    nuevos, iguales, rechazadas = [], [], []
+    with conn:
+        for f in filas:
+            valores = (f["cotizacion_pactada_uf"],
+                       f["fecha_derivacion_caec"].isoformat() if f["fecha_derivacion_caec"] else None)
+            actual = conn.execute(
+                "SELECT cotizacion_pactada_uf, fecha_derivacion_caec FROM beneficiarios WHERE beneficiario_id = ?",
+                (f["beneficiario_id"],),
+            ).fetchone()
+            if actual is None:
+                conn.execute(
+                    "INSERT INTO beneficiarios (beneficiario_id, cotizacion_pactada_uf, fecha_derivacion_caec) "
+                    "VALUES (?, ?, ?)", (f["beneficiario_id"], *valores))
+                nuevos.append(f["beneficiario_id"])
+            elif tuple(actual) == valores:
+                iguales.append(f["beneficiario_id"])
+            else:
+                rechazadas.append((f, f"beneficiary {f['beneficiario_id']} already exists with different data "
+                                      f"(cotización {actual[0]} UF, CAEC referral {actual[1] or 'none'}); "
+                                      "changing a beneficiary isn't supported"))
+    return nuevos, iguales, rechazadas
 
 
 def insertar_prestaciones(conn, filas: list[dict], recibido_en: datetime,
@@ -299,3 +332,95 @@ def reporte_ejecuciones(filas: list[dict]) -> str:
             f"{f['comando']}" + (f"  →  {f['mensaje']}" if f["mensaje"] else "")
         )
     return "\n".join(lineas) + "\n  (code* = uncommitted changes)"
+
+
+# ───────────────────────────────────────────────────────────
+# Excel template: a workbook to edit by hand and load with `ingerir --formato A`
+# ───────────────────────────────────────────────────────────
+
+# Synthetic examples that fit the seed (beneficiaries 1 and 2 already exist).
+EJEMPLO_BENEFICIARIOS = [
+    # id, cotización pactada UF, CAEC referral
+    (3, 4.0, None),                  # 29 × 4.0 = 116 UF, below the 122 UF tope
+    (4, 2.0, None),                  # 58 UF: a small deductible that isn't reached
+    (5, 6.5, date(2025, 3, 1)),      # 29 × 6.5 = 188.5 UF, capped at the tope; referred to CAEC
+]
+EJEMPLO_PRESTACIONES = [
+    # beneficiary, date, GES code, GES network, CAEC network, arancel, copago
+    (3, date(2025, 6, 12), "GES01", True, False, 4_500_000, 900_000),
+    (3, date(2025, 8, 20), "GES01", True, False, 6_000_000, 1_200_000),
+    (3, date(2025, 9, 1), None, True, False, 750_000, 150_000),              # not GES: doesn't count
+    (3, date(2025, 10, 5), "GES01", True, False, 5_500_000, 1_100_000),
+    (3, date(2025, 11, 10), "GES01", False, False, 2_000_000, 400_000),      # outside the GES network: doesn't count
+    (3, date(2026, 1, 15), "GES01", True, False, 5_000_000, 1_000_000),
+    (3, date(2026, 4, 2), "GES01", True, False, 4_000_000, 800_000),         # crosses the deductible
+    (4, date(2026, 2, 3), "GES01", True, False, 3_000_000, 600_000),         # window in 2026: the 130 UF rule
+    (4, date(2026, 5, 14), "GES01", True, False, 2_500_000, 500_000),
+    (5, date(2025, 2, 10), "GES01", True, True, 10_000_000, 2_000_000),
+    (5, date(2025, 4, 22), "GES01", True, True, 9_000_000, 1_800_000),
+    (5, date(2025, 7, 30), "GES01", True, True, 7_500_000, 1_500_000),       # crosses the deductible
+    (1, date(2025, 12, 1), "GES01", True, False, 1_000_000, 200_000),        # existing beneficiary: late data
+]
+
+_INSTRUCCIONES = [
+    "How to use this file",
+    "",
+    "1. Edit the Beneficiarios and Prestaciones sheets: add rows, change values. Keep the header row as it is.",
+    "2. Load it:          python -m src.motor ingerir --db data/motor.db --archivo <this file> --formato A",
+    "3. Recalculate:      python -m src.motor recalcular-todos --db data/motor.db --tipo GES",
+    "4. Check the result: python -m src.motor ver --db data/motor.db --beneficiario 3",
+    "",
+    "Beneficiarios (loaded first, so a new beneficiary and their prestaciones can go in the same file)",
+    "- ID Beneficiario: whole number. A new ID adds a beneficiary.",
+    "- An ID that already exists with the same data is skipped; with different data it is rejected (beneficiaries can't be changed).",
+    "- Cotización Pactada UF: greater than 0, e.g. 4.5 or 4,5.",
+    "- Fecha Derivación CAEC: a date, or empty if not referred.",
+    "",
+    "Prestaciones (append-only: loaded rows are never updated)",
+    "- ID Beneficiario must exist in the database or in the Beneficiarios sheet.",
+    "- Fecha Prestación: an Excel date, YYYY-MM-DD, DD-MM-YYYY or DD/MM/YYYY.",
+    "- Código GES: e.g. GES01; empty = not GES. Only GES01 has rules in the seed.",
+    "- Red GES / Red CAEC: S/N, Si/No, 1/0. Red GES empty = S.",
+    "- Arancel, Copago: whole pesos, e.g. 1000000, 1.000.000 or $ 1.000.000. GES copagos above 20% of the arancel are flagged.",
+    "- The rules and UF values in the seed cover 2025-01-01 to 2026-12-31.",
+    "",
+    "Loading the file again is safe: rows already loaded are rejected as duplicates and only new rows go in.",
+    "Rows that can't be read are listed with their row number and reason; the rest are loaded.",
+]
+
+
+def escribir_plantilla(path, columnas_prestaciones: dict[str, str]) -> None:
+    """Write the example workbook: Instrucciones, Beneficiarios, Prestaciones (headers from the format)."""
+    libro = openpyxl.Workbook()
+    ayuda = libro.active
+    ayuda.title = "Instrucciones"
+    for linea in _INSTRUCCIONES:
+        ayuda.append([linea])
+    ayuda["A1"].font = Font(bold=True)
+    ayuda.column_dimensions["A"].width = 130
+
+    def hoja(titulo, encabezado, filas, formatos):
+        h = libro.create_sheet(titulo)
+        h.append(encabezado)
+        for fila in filas:
+            h.append(list(fila))
+        for celda in h[1]:
+            celda.font = Font(bold=True)
+        for letra, formato in formatos.items():
+            h.column_dimensions[letra].width = 22
+            for (celda,) in h.iter_rows(min_row=2, min_col=ord(letra) - 64, max_col=ord(letra) - 64):
+                celda.number_format = formato
+        h.freeze_panes = "A2"
+
+    def si_no(b):
+        return "S" if b else "N"
+
+    campos_b = ("beneficiario_id", "cotizacion_pactada_uf", "fecha_derivacion_caec")
+    hoja(extractor.HOJA_BENEFICIARIOS, [extractor.COLUMNAS_BENEFICIARIOS[c] for c in campos_b],
+         EJEMPLO_BENEFICIARIOS, {"A": "0", "B": "0.0", "C": "yyyy-mm-dd"})
+    campos_p = ("beneficiario_id", "fecha_prestacion", "codigo_ges", "en_red_ges", "en_red_caec",
+                "monto_arancel", "monto_copago")
+    hoja(extractor.HOJA_PRESTACIONES, [columnas_prestaciones[c] for c in campos_p],
+         [(b, d, c, si_no(rg), si_no(rc), a, cp) for b, d, c, rg, rc, a, cp in EJEMPLO_PRESTACIONES],
+         {"A": "0", "B": "yyyy-mm-dd", "C": "@", "D": "@", "E": "@", "F": "#,##0", "G": "#,##0"})
+    libro.save(path)

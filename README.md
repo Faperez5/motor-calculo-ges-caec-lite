@@ -45,14 +45,19 @@ python -m src.motor historial --db data/motor.db --beneficiario 1 --tipo GES
 python -m src.motor ingerir --db data/motor.db --archivo data/export.xlsx --formato A
 python -m src.motor recalcular-todos --db data/motor.db --tipo GES
 
+# an example Excel file with new beneficiaries and prestaciones: edit it, then load it as above
+python -m src.motor plantilla --archivo data/carga_ejemplo.xlsx
+
 # every command that changed the database: who, when, exact command line, code version, outcome
 python -m src.motor ejecuciones --db data/motor.db
 ```
 
 `ingerir` never drops a row silently: rows it can't read (bad date, missing amount,
 unknown beneficiary, duplicate of a stored prestación) are listed with their Excel row
-number and reason, and the rest are loaded. The column layouts live in `FORMATOS` in
-`src/motor.py`.
+number and reason, and the rest are loaded. An optional `Beneficiarios` sheet adds new
+beneficiaries first. The column layouts live in `FORMATOS` in `src/motor.py`.
+`plantilla` writes a ready-made example file (git-ignored under `data/`), and loading it
+again after adding rows only loads the new ones.
 
 `calcular` prints the audit trace of the saved result: rule version, derived window,
 deductible, crossing date, what data the run knew, the git commit that ran, data
@@ -75,9 +80,9 @@ run that loaded it, and the current result per type. It's read-only.
 
 | Module | Role | Main functions |
 |---|---|---|
-| `src/extractor.py` | **Extract**: reads SQLite and Excel, never writes | `leer_prestaciones` (as-of `conocido_hasta`), `leer_reglas_ges`, `leer_valores_uf`, `leer_resultado_vigente`, `leer_ficha` (data for `ver`), `leer_excel_prestaciones` |
+| `src/extractor.py` | **Extract**: reads SQLite and Excel, never writes | `leer_prestaciones` (as-of `conocido_hasta`), `leer_reglas_ges`, `leer_valores_uf`, `leer_resultado_vigente`, `leer_ficha` (data for `ver`), `leer_excel_prestaciones`, `leer_excel_beneficiarios` |
 | `src/calculo.py` | **Transform**: pure, no I/O (a test enforces it) | `calcular_ges` (filter → window → rule → deductible → split), `motivo_recalculo`, `validar_reglas`, `chequear_datos`, `planear_nueva_version` |
-| `src/loader.py` | **Load**: every write, plus the text reports | `guardar_resultado` (versioned, refuses a result that knew less), `cargar_regla_ges`, `insertar_prestaciones`, `reporte_texto`, `reporte_simulacion`, `reporte_ficha`, `reporte_historial` |
+| `src/loader.py` | **Load**: every write, the text reports, the Excel template | `guardar_resultado` (versioned, refuses a result that knew less), `cargar_regla_ges`, `insertar_beneficiarios`, `insertar_prestaciones`, `reporte_texto`, `reporte_simulacion`, `reporte_ficha`, `reporte_historial`, `escribir_plantilla` |
 | `src/motor.py` | CLI: wires extract → transform → load | `evaluar` (no save, behind `--simular`), `calcular` (`evaluar` + save), `main` |
 
 Full command reference and calculation rules: [`user_guide.md`](user_guide.md).

@@ -27,7 +27,8 @@ Run every command from the project root. Every subcommand has `--help`.
 | `calcular` | yes, if changed | Calculates one beneficiary and saves a new version only if the result changed |
 | `recalcular-todos` | yes, if changed | Runs `calcular` for every beneficiary |
 | `cargar-regla-ges` | yes | Loads a new version of a GES rule (future or retroactive) |
-| `ingerir` | yes | Loads prestaciones from an Excel export |
+| `ingerir` | yes | Loads beneficiaries (optional sheet) and prestaciones from an Excel file |
+| `plantilla` | no (writes a file) | Writes an example Excel file to edit and load with `ingerir` |
 | `ver` | no | One beneficiary's data: details, prestaciones (and when each arrived), current results |
 | `historial` | no | Every saved version of one beneficiary's result, and why each changed |
 | `ejecuciones` | no | The run log: every command that wrote to the database |
@@ -94,7 +95,30 @@ python -m src.motor cargar-regla-ges --db data/motor.db --codigo GES01 --desde 2
 python -m src.motor ingerir --db data/motor.db --archivo data/export.xlsx --formato A|B [--ahora]
 ```
 
-Reads the first sheet of an `.xlsx` file and appends the rows as prestaciones, with `recibido_en = --ahora`. Rules are in §6. Existing prestaciones are never updated. Run `recalcular-todos` afterwards.
+Reads an `.xlsx` file:
+1. **`Beneficiarios` sheet** (optional): adds new beneficiaries first, so a new beneficiary and their prestaciones can go in the same file.
+2. **`Prestaciones` sheet** (or the first sheet, if none has that name): appends the rows as prestaciones, with `recibido_en = --ahora`.
+
+Both sheets are read before anything is written, so a file-level problem loads nothing. Existing prestaciones and beneficiaries are never updated. Rules are in §6. Run `recalcular-todos` afterwards.
+
+### `plantilla`
+
+```bash
+python -m src.motor plantilla --archivo data/carga_ejemplo.xlsx
+```
+
+Writes an example workbook to edit by hand and load with `ingerir --formato A`. It has three sheets: `Instrucciones`, `Beneficiarios` (3 new synthetic beneficiaries) and `Prestaciones` (13 rows for them and one for beneficiary 1). It never overwrites an existing file, since it may hold your edits; delete or rename the file to get a fresh copy. It doesn't touch any database.
+
+The workflow:
+```bash
+python -m src.motor plantilla --archivo data/carga_ejemplo.xlsx      # once
+# edit the file in Excel / LibreOffice: add beneficiaries, add prestaciones
+python -m src.motor ingerir --db data/motor.db --archivo data/carga_ejemplo.xlsx --formato A
+python -m src.motor recalcular-todos --db data/motor.db --tipo GES
+python -m src.motor ver --db data/motor.db --beneficiario 3
+```
+
+Loading the same file again after adding rows is safe: rows already loaded come back as duplicates or "already stored", and only the new rows go in.
 
 ### `ver`
 
@@ -210,19 +234,31 @@ Headers are matched ignoring case, accents and extra spaces. Column order doesn'
 
 A new layout is a new entry in `FORMATOS` in `src/motor.py`. No other code changes.
 
+The **`Beneficiarios` sheet** has one layout, whatever the `--formato`:
+
+| Field | Header | Required |
+|---|---|---|
+| beneficiary id | `ID Beneficiario` | yes |
+| cotización pactada | `Cotización Pactada UF` | yes, greater than 0 |
+| CAEC referral date | `Fecha Derivación CAEC` | no (empty = not referred) |
+
+A new ID adds a beneficiary. An ID already stored with the same data is skipped ("already stored"). One stored with different data is rejected, because changing a beneficiary isn't supported.
+
 ### Accepted values
 
 | Type | Accepted |
 |---|---|
 | Dates | Excel date cells, `YYYY-MM-DD`, `DD-MM-YYYY`, `DD/MM/YYYY` |
 | Amounts (CLP) | `1234567`, `1.234.567`, `$ 1.234.567`, `1234567,00`. Whole pesos, not negative |
+| UF (cotización) | `4`, `4.5`, `4,5`. Greater than 0 |
 | Yes/no | `S`/`N`, `Si`/`No`, `Y`/`Yes`, `1`/`0`, `true`/`false`, `X` |
 | GES code | trimmed and uppercased |
 
 ### What gets rejected
 
-- **Whole file:** not a readable `.xlsx`, empty, or a required column missing (usually the wrong `--formato`).
-- **Single row:** a value that can't be read, a missing required value, a beneficiary that doesn't exist, or a duplicate of a stored prestación (same beneficiary, date, code, networks and amounts, D12).
+- **Whole file:** not a readable `.xlsx`, an empty sheet, or a required column missing in either sheet (usually the wrong `--formato`). Nothing is loaded, not even the beneficiaries.
+- **Single prestación row:** a value that can't be read, a missing required value, a beneficiary that doesn't exist (in the database or the `Beneficiarios` sheet), or a duplicate of a stored prestación (same beneficiary, date, code, networks and amounts, D12).
+- **Single beneficiary row:** a value that can't be read, or an ID already stored with different data.
 
 Rejected rows are listed with their Excel row number and reason, and the other rows load. Blank rows are skipped. The run log records the file's SHA-256.
 

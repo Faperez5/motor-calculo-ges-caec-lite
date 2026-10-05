@@ -234,12 +234,24 @@ def leer_ids_beneficiarios(conn) -> list[int]:
 # Excel ingestion (phase 5)
 # ───────────────────────────────────────────────────────────
 
+HOJA_PRESTACIONES = "Prestaciones"
+HOJA_BENEFICIARIOS = "Beneficiarios"
+
 OBLIGATORIOS = ("beneficiario_id", "fecha_prestacion", "en_red_caec", "monto_arancel", "monto_copago")
 OPCIONALES = {"codigo_ges": None, "en_red_ges": True}     # value used when the column is absent or empty
 
+# The Beneficiarios sheet has one layout whatever the prestaciones format.
+COLUMNAS_BENEFICIARIOS = {
+    "beneficiario_id": "ID Beneficiario",
+    "cotizacion_pactada_uf": "Cotización Pactada UF",
+    "fecha_derivacion_caec": "Fecha Derivación CAEC",
+}
+OBLIGATORIOS_BENEFICIARIOS = ("beneficiario_id", "cotizacion_pactada_uf")
+OPCIONALES_BENEFICIARIOS = {"fecha_derivacion_caec": None}     # empty = not referred to CAEC
+
 
 def leer_excel_prestaciones(path, mapeo: dict[str, str]) -> tuple[list[dict], list[tuple[int, str]]]:
-    """Read prestaciones from the first sheet of an .xlsx file.
+    """Read prestaciones from an .xlsx file: the sheet named 'Prestaciones', or the first sheet.
 
     `mapeo` maps engine field → column header in this file format. Headers
     match ignoring case, accents and extra spaces. Returns (rows, rejected):
@@ -248,19 +260,35 @@ def leer_excel_prestaciones(path, mapeo: dict[str, str]) -> tuple[list[dict], li
     rejected is [(excel row number, reason)]. No row is dropped silently.
     A missing required column refuses the whole file (wrong format).
     """
+    return _leer_excel(path, HOJA_PRESTACIONES, mapeo, _PARSERS, OBLIGATORIOS, OPCIONALES, primera_si_falta=True)
+
+
+def leer_excel_beneficiarios(path) -> tuple[list[dict], list[tuple[int, str]]] | None:
+    """The optional 'Beneficiarios' sheet, same contract as leer_excel_prestaciones. None if the file has none."""
+    return _leer_excel(path, HOJA_BENEFICIARIOS, COLUMNAS_BENEFICIARIOS, _PARSERS_BENEFICIARIOS,
+                       OBLIGATORIOS_BENEFICIARIOS, OPCIONALES_BENEFICIARIOS, primera_si_falta=False)
+
+
+def _leer_excel(path, nombre_hoja, mapeo, parsers, obligatorios, opcionales, primera_si_falta):
     try:
         libro = openpyxl.load_workbook(path, read_only=True, data_only=True)
     except (InvalidFileException, zipfile.BadZipFile, KeyError) as e:
         raise ValueError(f"{path} is not a readable .xlsx file ({e})") from None
     try:
-        filas_excel = libro.worksheets[0].iter_rows(values_only=True)
+        if nombre_hoja in libro.sheetnames:
+            hoja = libro[nombre_hoja]
+        elif primera_si_falta:
+            hoja = libro.worksheets[0]
+        else:
+            return None
+        filas_excel = hoja.iter_rows(values_only=True)
         encabezado = next(filas_excel, None)
         if encabezado is None:
-            raise ValueError(f"{path} is empty")
+            raise ValueError(f"{path}: sheet '{hoja.title}' is empty")
         columnas = {_normalizar(h): i for i, h in enumerate(encabezado) if h is not None}
-        faltan = [mapeo[c] for c in OBLIGATORIOS if _normalizar(mapeo[c]) not in columnas]
+        faltan = [mapeo[c] for c in obligatorios if _normalizar(mapeo[c]) not in columnas]
         if faltan:
-            raise ValueError(f"{path} is missing columns {faltan}: wrong --formato?")
+            raise ValueError(f"{path}: sheet '{hoja.title}' is missing columns {faltan}: wrong --formato?")
         indice = {campo: columnas.get(_normalizar(col)) for campo, col in mapeo.items()}
 
         filas, rechazadas = [], []
@@ -268,7 +296,7 @@ def leer_excel_prestaciones(path, mapeo: dict[str, str]) -> tuple[list[dict], li
             if all(v is None or str(v).strip() == "" for v in valores):
                 continue
             try:
-                filas.append({**_leer_fila(valores, indice), "fila_excel": n})
+                filas.append({**_leer_fila(valores, indice, parsers, opcionales), "fila_excel": n})
             except ValueError as e:
                 rechazadas.append((n, str(e)))
         return filas, rechazadas
@@ -276,14 +304,14 @@ def leer_excel_prestaciones(path, mapeo: dict[str, str]) -> tuple[list[dict], li
         libro.close()
 
 
-def _leer_fila(valores, indice) -> dict:
+def _leer_fila(valores, indice, parsers, opcionales) -> dict:
     fila = {}
-    for campo, parser in _PARSERS.items():
+    for campo, parser in parsers.items():
         i = indice.get(campo)
         crudo = valores[i] if i is not None and i < len(valores) else None
         if crudo is None or (isinstance(crudo, str) and crudo.strip() == ""):
-            if campo in OPCIONALES:
-                fila[campo] = OPCIONALES[campo]
+            if campo in opcionales:
+                fila[campo] = opcionales[campo]
                 continue
             raise ValueError(f"{campo}: missing")
         try:
@@ -365,6 +393,22 @@ def _monto(v) -> int:
     return monto
 
 
+def _uf(v) -> float:
+    """UF amount, > 0: 5, 5.5, '5.5', '5,5' (decimal comma)."""
+    if isinstance(v, bool):
+        raise ValueError(f"can't read {v!r} as UF")
+    if isinstance(v, (int, float)):
+        uf = float(v)
+    else:
+        texto = str(v).replace(" ", "").strip()
+        if not re.fullmatch(r"\d+([.,]\d+)?", texto):
+            raise ValueError(f"can't read {v!r} as UF (e.g. 4.5 or 4,5)")
+        uf = float(texto.replace(",", "."))
+    if uf <= 0:
+        raise ValueError(f"{v!r} must be greater than 0")
+    return uf
+
+
 _PARSERS = {
     "beneficiario_id": _entero,
     "fecha_prestacion": _fecha_excel,
@@ -373,6 +417,12 @@ _PARSERS = {
     "en_red_caec": _booleano,
     "monto_arancel": _monto,
     "monto_copago": _monto,
+}
+
+_PARSERS_BENEFICIARIOS = {
+    "beneficiario_id": _entero,
+    "cotizacion_pactada_uf": _uf,
+    "fecha_derivacion_caec": _fecha_excel,
 }
 
 

@@ -8,6 +8,7 @@
     python -m src.motor cargar-regla-ges --db data/motor.db --codigo GES01 --desde 2025-03-01
                                  --tope-uf 125 --fuente "Decreto X"
     python -m src.motor ingerir --db data/motor.db --archivo data/export.xlsx --formato A
+    python -m src.motor plantilla --archivo data/carga_ejemplo.xlsx
     python -m src.motor ver --db data/motor.db --beneficiario 1 [--conocido-hasta 2026-03-04T23:59]
     python -m src.motor historial --db data/motor.db --beneficiario 1 --tipo GES
     python -m src.motor ejecuciones --db data/motor.db
@@ -180,12 +181,17 @@ def _args(argv):
     p.add_argument("--beneficiario", type=int, required=True)
     p.add_argument("--tipo", choices=["GES"], required=True)
 
-    p = sub.add_parser("ingerir", help="load prestaciones from an Excel export")
+    p = sub.add_parser("ingerir", help="load beneficiaries and prestaciones from an Excel file")
     p.add_argument("--db", required=True)
-    p.add_argument("--archivo", required=True, help=".xlsx file; the first sheet is read")
-    p.add_argument("--formato", choices=sorted(FORMATOS), required=True, help="which column layout the file uses")
+    p.add_argument("--archivo", required=True,
+                   help=".xlsx file: sheet 'Prestaciones' (or the first sheet), plus an optional 'Beneficiarios' sheet")
+    p.add_argument("--formato", choices=sorted(FORMATOS), required=True,
+                   help="column layout of the prestaciones sheet")
     p.add_argument("--ahora", type=datetime.fromisoformat,
                    help="reception time stored as recibido_en (default: now)")
+
+    p = sub.add_parser("plantilla", help="write an example Excel file to edit and load with `ingerir --formato A`")
+    p.add_argument("--archivo", required=True, help="where to write it, e.g. data/carga_ejemplo.xlsx")
 
     p = sub.add_parser("ejecuciones", help="the log of commands run against this database")
     p.add_argument("--db", required=True)
@@ -199,6 +205,8 @@ ESCRIBEN = {"init", "calcular", "recalcular-todos", "cargar-regla-ges", "ingerir
 def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else list(argv)
     args = _args(argv)
+    if args.comando == "plantilla":         # writes a file, not the database: nothing to open or log
+        return _plantilla(Path(args.archivo))
     db = Path(args.db)
     if args.comando == "init" and db.exists():
         print(f"error: {db} already exists. Delete it to start over.", file=sys.stderr)
@@ -299,19 +307,50 @@ def _ejecutar(conn, args, version: str, eid: int | None) -> tuple[int, str | Non
 
 
 def _ingerir(conn, args, ahora, eid) -> tuple[int, str]:
-    """Excel → prestaciones. Rejected rows are listed, never dropped silently."""
+    """Excel → beneficiaries (optional sheet), then prestaciones. Rejected rows are listed, never dropped silently.
+
+    Both sheets are read before anything is written, so a file-level problem
+    (wrong format, missing column) loads nothing at all.
+    """
     archivo = Path(args.archivo)
     huella = hashlib.sha256(archivo.read_bytes()).hexdigest()[:12]
+    hoja_b = extractor.leer_excel_beneficiarios(archivo)
     filas, rechazadas = extractor.leer_excel_prestaciones(archivo, FORMATOS[args.formato])
+
+    resumen_b = ""
+    if hoja_b is not None:
+        filas_b, rechazados_b = hoja_b
+        nuevos, iguales, conflictos = loader.insertar_beneficiarios(conn, filas_b)
+        rechazados_b += [(f["fila_excel"], motivo) for f, motivo in conflictos]
+        resumen_b = (f"beneficiaries: {len(nuevos)} new, {len(iguales)} already stored, "
+                     f"{len(rechazados_b)} rejected; ")
+        print(f"{archivo.name} [{extractor.HOJA_BENEFICIARIOS}]: {len(nuevos) + len(iguales) + len(rechazados_b)} "
+              f"rows, {len(nuevos)} new, {len(iguales)} already stored, {len(rechazados_b)} rejected")
+        for n, motivo in sorted(rechazados_b):
+            print(f"  row {n}: {motivo}")
+
     nuevas, duplicadas = loader.insertar_prestaciones(conn, filas, ahora, eid)
     rechazadas += [(f["fila_excel"], motivo) for f, motivo in duplicadas]
-
     print(f"{archivo.name}: {len(nuevas) + len(rechazadas)} rows, {len(nuevas)} loaded, {len(rechazadas)} rejected")
     for n, motivo in sorted(rechazadas):
         print(f"  row {n}: {motivo}")
     if nuevas:
         print("run `recalcular-todos` to apply them")
-    return 0, f"{archivo.name} (sha256 {huella}): {len(nuevas)} loaded, {len(rechazadas)} rejected"
+    return 0, f"{archivo.name} (sha256 {huella}): {resumen_b}{len(nuevas)} loaded, {len(rechazadas)} rejected"
+
+
+def _plantilla(archivo: Path) -> int:
+    """Write the example workbook (format A). Never overwrites: it may hold your edits."""
+    if archivo.exists():
+        print(f"error: {archivo} already exists. Delete or rename it to get a fresh copy.", file=sys.stderr)
+        return 1
+    archivo.parent.mkdir(parents=True, exist_ok=True)
+    loader.escribir_plantilla(archivo, FORMATOS["A"])
+    print(f"wrote {archivo}: {len(loader.EJEMPLO_BENEFICIARIOS)} beneficiaries, "
+          f"{len(loader.EJEMPLO_PRESTACIONES)} prestaciones. Edit it, then:\n"
+          f"  python -m src.motor ingerir --db data/motor.db --archivo {archivo} --formato A\n"
+          f"  python -m src.motor recalcular-todos --db data/motor.db --tipo GES")
+    return 0
 
 
 def _recalcular_todos(conn, args, ahora, version, eid) -> tuple[int, str]:
